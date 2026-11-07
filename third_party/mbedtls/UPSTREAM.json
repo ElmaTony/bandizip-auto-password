@@ -1,0 +1,26 @@
+{
+  "tag": "v2.28.9",
+  "source": "https://raw.githubusercontent.com/Mbed-TLS/mbedtls/v2.28.9/",
+  "files": [
+    {
+      "path": "library/blowfish.c",
+      "sha256": "990b92268e8ee85bc3e179672d1fbb7389452241b86636a9a654501b8e1cc81f"
+    },
+    {
+      "path": "library/common.h",
+      "sha256": "dc64b7334fb329a5c6c3859575c90f739082d00709a67b774024a00d0135f6f0"
+    },
+    {
+      "path": "include/mbedtls/blowfish.h",
+      "sha256": "d21f1b322d233db8cddc2c486a0d075be4adc106a477bff2de42d98ca0e1934b"
+    },
+    {
+      "path": "include/mbedtls/platform_util.h",
+      "sha256": "7cc9a00e3443a44973da917368991a379218512e9afde165c953c69edacdad86"
+    },
+    {
+      "path": "LICENSE",
+      "sha256": "9b405ef4c89342f5eae1dd828882f931747f71001cfba7d114801039b52ad09b"
+    }
+  ]
+}

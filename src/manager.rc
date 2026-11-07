@@ -1,0 +1,26 @@
+#pragma code_page(65001)
+1 24 "manager.manifest"
+101 ICON "../assets/app.ico"
+1 VERSIONINFO
+FILEVERSION 1,1,0,0
+PRODUCTVERSION 1,1,0,0
+FILEFLAGSMASK 0x3fL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+BEGIN
+ BLOCK "StringFileInfo"
+ BEGIN
+  BLOCK "040904b0"
+  BEGIN
+   VALUE "FileDescription", "Bandizip Auto Password Manager\0"
+   VALUE "FileVersion", "1.1.0\0"
+   VALUE "ProductName", "Bandizip Auto Password\0"
+   VALUE "ProductVersion", "1.1.0\0"
+  END
+ END
+ BLOCK "VarFileInfo"
+ BEGIN
+  VALUE "Translation", 0x409, 1200
+ END
+END

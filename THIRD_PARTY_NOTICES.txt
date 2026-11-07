@@ -1,0 +1,14 @@
+Mbed TLS 2.28.9 — Blowfish implementation
+https://github.com/Mbed-TLS/mbedtls/tree/v2.28.9
+Copyright The Mbed TLS Contributors; upstream file notices are retained.
+
+The included source is available upstream under Apache-2.0 OR GPL-2.0-or-later.
+This project elects Apache-2.0 for the included Mbed TLS code.
+The complete upstream license is included at third_party/mbedtls/LICENSE.
+Only Blowfish ECB is enabled; no Mbed TLS networking or TLS stack is built.
+The minimal include/mbedtls/config.h is project configuration.
+Source URLs and SHA256 values are recorded in third_party/mbedtls/UPSTREAM.json.
+
+Bandizip is a product of Bandisoft. This is an independent interoperability
+extension, not an official Bandisoft plugin. No Bandisoft binary or commercial
+Ark SDK header is redistributed. Users must supply their existing installation.

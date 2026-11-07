@@ -1,0 +1,17 @@
+name: Windows x64
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare compiler
+        shell: pwsh
+        run: ./tools/bootstrap-zig.ps1
+      - name: Build and unit checks
+        shell: pwsh
+        run: ./build.ps1 -Tests -OutputDirectory release
+      - name: Privacy checks
+        run: python tools/privacy_check.py
