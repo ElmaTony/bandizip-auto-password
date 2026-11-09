@@ -17,7 +17,7 @@ Push-Location $root
 try {
     & $ZigPath cc -target x86_64-windows-gnu -march=x86_64 -O2 -c 'third_party/mbedtls/library/blowfish.c' '-Ithird_party/mbedtls/include' -o 'build/blowfish.o'
     if ($LASTEXITCODE -ne 0) { throw 'Blowfish 组件构建失败。' }
-    $common = @('src/common.cpp','src/password_store.cpp','src/reporting.cpp','build/blowfish.o')
+    $common = @('src/common.cpp','src/password_store.cpp','src/reporting.cpp','src/recycle.cpp','build/blowfish.o')
     $flags = @('-target','x86_64-windows-gnu','-march=x86_64','-std=c++17','-O2','-g0','-s','-DNDEBUG','-static','-Ibuild','-Ithird_party/mbedtls/include','-DUNICODE','-D_UNICODE','-U_WIN32_WINNT','-D_WIN32_WINNT=0x0A00','-DWINVER=0x0A00')
     $libraries = @('-ladvapi32','-luser32','-lgdi32','-lcomctl32','-lshell32','-lole32','-luuid','-lversion','-lbcrypt')
     & $ZigPath c++ @flags -shared 'src/proxy.cpp' @common @libraries -o (Join-Path $dist 'ark.x64.dll')

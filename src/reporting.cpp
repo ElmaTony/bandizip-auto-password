@@ -42,6 +42,13 @@ void Append(const std::wstring &path, const std::string &line) {
 std::wstring Description(const Result &r) {
     if (r.outcome == L"success")
         return L"已解压";
+    if (r.outcome == L"recycled")
+        return L"已解压，压缩包已移入回收站（" + std::to_wstring(r.recycledVolumes) + L" 个文件）";
+    if (r.outcome == L"recycle_failed")
+        return L"已解压，回收未全部完成（" + std::to_wstring(r.recycledVolumes) + L"/" +
+               std::to_wstring(r.sourceVolumes) + L"）；未回收的原文件已保留";
+    if (r.outcome == L"recycle_unconfirmed")
+        return L"已解压，无法确认完整原文件列表，已保留压缩包";
     if (r.outcome == L"canceled")
         return L"已取消";
     if (r.outcome == L"passwords_exhausted")
@@ -182,7 +189,9 @@ void RecordResult(const Result &r, bool notify) {
                         ",\"attempts\":" + std::to_string(r.attempts) +
                         ",\"saved_password_count\":" + std::to_string(r.savedCount) +
                         ",\"completed_files\":" + std::to_string(r.completedFiles) +
-                        ",\"opening\":" + (r.opening ? "true" : "false") + "}\r\n";
+                        ",\"opening\":" + (r.opening ? "true" : "false") +
+                        ",\"source_volumes\":" + std::to_string(r.sourceVolumes) +
+                        ",\"recycled_volumes\":" + std::to_string(r.recycledVolumes) + "}\r\n";
             Append(Join(directory, L"history.jsonl"), json);
             auto line = time + "  " + Utf8(Description(r)) + "\r\n" + Utf8(r.archive) + "\r\n自动尝试：" +
                         std::to_string(r.attempts) + " 次；错误码：" + std::to_string(r.error) + "\r\n\r\n";
@@ -193,7 +202,7 @@ void RecordResult(const Result &r, bool notify) {
     if (mutex)
         CloseHandle(mutex);
     Trace(L"RESULT " + r.outcome + L" " + r.archive);
-    if (notify && r.outcome != L"success" && r.outcome != L"canceled") {
+    if (notify && r.outcome != L"success" && r.outcome != L"recycled" && r.outcome != L"canceled") {
         {
             std::lock_guard<std::mutex> guard(pendingMutex);
             pending.push_back(r);

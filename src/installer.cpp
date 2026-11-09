@@ -68,7 +68,7 @@ InstallResult Failure(const std::wstring &message, DWORD code = 0) {
     return {false, code, message + L"\n" + SystemError(code)};
 }
 bool SaveManifest(const std::wstring &dir, const std::string &proxy) {
-    auto body = "[Installation]\r\nProduct=BandizipAutoPassword\r\nVersion=1.1.0\r\nEngineVersion=7.47.0."
+    auto body = "[Installation]\r\nProduct=BandizipAutoPassword\r\nVersion=1.2.0\r\nEngineVersion=7.47.0."
                 "1\r\nOriginalSHA256=" +
                 std::string(SupportedArkSha256) + "\r\nProxySHA256=" + proxy +
                 "\r\nInstalledUTC=" + UtcNow() + "\r\n";
@@ -90,7 +90,7 @@ InstallStatus GetInstallStatus(const std::wstring &directory, const std::wstring
     out.supported = out.version == L"7.47.0.1" && IsAmd64Image(app) &&
                     (out.installed || currentHash == SupportedArkSha256 || recovery);
     if (out.installed && !out.supported)
-        out.detail = L"Bandizip 版本已变化，自动匹配已停用，请恢复原组件";
+        out.detail = L"Bandizip 版本已变化，自动匹配已停用，请卸载插件";
     else if (out.installed)
         out.detail = L"自动密码扩展已安装";
     else if (recovery && out.supported)
@@ -167,7 +167,7 @@ InstallResult Uninstall(const std::wstring &directory) {
     if (dir.empty() || !Exists(Join(dir, L"Bandizip.exe")))
         return Failure(L"这个文件夹内没有 Bandizip.exe", ERROR_PATH_NOT_FOUND);
     if (InUse(dir))
-        return Failure(L"请先关闭 Bandizip 的所有窗口，再恢复原组件。", ERROR_BUSY);
+        return Failure(L"请先关闭 Bandizip 的所有窗口，再卸载插件。", ERROR_BUSY);
     auto manifest = Manifest(dir);
     auto proxyHash = Utf8(Ini(manifest, L"ProxySHA256"));
     auto engine = Join(dir, L"ark.x64.dll");
@@ -219,6 +219,6 @@ InstallResult Uninstall(const std::wstring &directory) {
     MoveFileExW(manifest.c_str(), Join(Directory(manifest), L"installation.inactive.ini").c_str(),
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
     return {true, 0,
-            L"已恢复原版解压引擎。原密码管理器和文件关联均保留。\n备份及解压记录继续保留，方便核对。"};
+            L"已卸载插件并恢复原版解压引擎。原密码管理器和文件关联均保留。\n备份及解压记录继续保留，方便核对。"};
 }
 } // namespace bzap

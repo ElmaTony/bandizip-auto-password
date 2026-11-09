@@ -266,7 +266,10 @@ Settings LoadSettings() {
     auto ini = Join(DataDirectory(), L"settings.ini");
     s.enabled = GetPrivateProfileIntW(L"General", L"Enabled", 1, ini.c_str()) != 0;
     s.notify = GetPrivateProfileIntW(L"General", L"NotifyFailures", 1, ini.c_str()) != 0;
-    s.verify = GetPrivateProfileIntW(L"General", L"VerifyBeforeExtract", 1, ini.c_str()) != 0;
+    // Earlier releases enabled full preflight implicitly. Require a fresh,
+    // explicit opt-in rather than carrying that default into single-pass mode.
+    s.verify = GetPrivateProfileIntW(L"General", L"FullPreflight", 0, ini.c_str()) != 0;
+    s.recycle = GetPrivateProfileIntW(L"General", L"RecycleAfterExtract", 0, ini.c_str()) != 0;
     return s;
 }
 void Trace(const std::wstring &text) {

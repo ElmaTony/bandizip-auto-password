@@ -9,6 +9,7 @@ struct Result {
     ark::Error error = 0;
     std::size_t attempts = 0, savedCount = 0, completedFiles = 0;
     bool opening = false;
+    unsigned sourceVolumes = 0, recycledVolumes = 0;
 };
 void RecordResult(const Result &result, bool notify);
 void OperationStarted();

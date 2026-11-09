@@ -5,12 +5,13 @@
 #include <windows.h>
 
 namespace bzap {
-inline constexpr wchar_t ProductVersion[] = L"1.1.0";
+inline constexpr wchar_t ProductVersion[] = L"1.2.0";
 inline constexpr wchar_t OriginalDllName[] = L"ark.bzap-original.x64.dll";
 inline constexpr char SupportedArkSha256[] =
     "868a4b870f43024688d4e9c74d9c4e42bc7f4e439972a93059ee95f4a2dbb135";
 struct Settings {
-    bool enabled = true, notify = true, verify = true;
+    bool enabled = true, notify = true, verify = false;
+    bool recycle = false;
 };
 std::wstring ModulePath(HMODULE module = nullptr);
 std::wstring Directory(const std::wstring &path);

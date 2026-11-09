@@ -18,9 +18,10 @@ enum ControlId {
     NotifyCheck,
     VerifyCheck,
     BrowseButton,
-    ClearButton
+    ClearButton,
+    RecycleCheck
 };
-HWND mainWindow, directoryText, enabledCheck, notifyCheck, verifyCheck;
+HWND mainWindow, directoryText, enabledCheck, notifyCheck, verifyCheck, recycleCheck;
 HFONT bodyFont, smallFont, titleFont, headingFont;
 HBRUSH whiteBrush;
 UINT dpi = 96;
@@ -89,6 +90,7 @@ void Refresh() {
     SendMessageW(enabledCheck, BM_SETCHECK, settings.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(notifyCheck, BM_SETCHECK, settings.notify ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(verifyCheck, BM_SETCHECK, settings.verify ? BST_CHECKED : BST_UNCHECKED, 0);
+    SendMessageW(recycleCheck, BM_SETCHECK, settings.recycle ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowTextW(GetDlgItem(mainWindow, InstallButton),
                    installStatus.installed ? L"修复接入" : L"安装接入");
     EnableWindow(GetDlgItem(mainWindow, InstallButton), installStatus.supported && !elevation);
@@ -105,7 +107,7 @@ void DrawScene(HDC dc) {
                                   LR_SHARED);
     DrawIconEx(dc, S(32), S(30), icon, S(48), S(48), 0, nullptr, DI_NORMAL);
     Text(dc, L"Bandizip 自动密码", Rect(96, 25, 600, 42), titleFont, Ink);
-    Text(dc, L"AUTO PASSWORD  /  1.1", Rect(97, 69, 550, 22), smallFont, Muted);
+    Text(dc, L"AUTO PASSWORD  /  1.2", Rect(97, 69, 550, 22), smallFont, Muted);
     Card(dc, Rect(32, 120, 856, 142), RGB(255, 255, 255));
     Card(dc, Rect(56, 145, 5, 86), installStatus.supported ? Accent : RGB(210, 143, 51));
     Text(dc, statusTitle, Rect(78, 141, 620, 28), headingFont, Ink);
@@ -116,8 +118,9 @@ void DrawScene(HDC dc) {
     Text(dc, L"解压偏好", Rect(32, 395, 500, 24), bodyFont, Ink);
     Card(dc, Rect(32, 432, 856, 160), RGB(255, 255, 255));
     Text(dc, L"使用 Bandizip 内已有的密码", Rect(478, 444, 382, 30), smallFont, Muted);
-    Text(dc, L"列出未完成的压缩包", Rect(478, 489, 382, 30), smallFont, Muted);
-    Text(dc, L"先校验再写出文件，耗时可能增加", Rect(478, 534, 382, 30), smallFont, Muted);
+    Text(dc, L"列出未完成的压缩包", Rect(478, 480, 382, 30), smallFont, Muted);
+    Text(dc, L"额外读取并解压一次，增加耗时", Rect(478, 516, 382, 30), smallFont, Muted);
+    Text(dc, L"仅完整解压成功；含已确认的分卷", Rect(478, 552, 382, 30), smallFont, Muted);
     Text(dc, L"Windows x64  ·  本地处理  ·  无需常驻助手", Rect(32, 674, 810, 20), smallFont, Muted);
 }
 HWND Control(const wchar_t *kind, const wchar_t *text, DWORD style, int x, int y, int w, int h, int id) {
@@ -127,13 +130,13 @@ HWND Control(const wchar_t *kind, const wchar_t *text, DWORD style, int x, int y
     return c;
 }
 void Layout() {
-    const int ids[] = {InstallButton, RemoveButton, RecordsButton, ClearButton, RefreshButton,
-                       BrowseButton,  EnabledCheck, NotifyCheck,   VerifyCheck, 200};
+    const int ids[] = {InstallButton, RemoveButton, RecordsButton, ClearButton, RefreshButton, BrowseButton,
+                       EnabledCheck,  NotifyCheck,  VerifyCheck,   200,         RecycleCheck};
     const int boxes[][4] = {{32, 616, 180, 44},  {228, 616, 140, 44}, {384, 616, 140, 44},
                             {540, 616, 140, 44}, {748, 616, 140, 44}, {776, 326, 96, 36},
-                            {56, 444, 400, 32},  {56, 489, 400, 32},  {56, 534, 400, 32},
-                            {50, 332, 710, 28}};
-    for (int i = 0; i < 10; i++) {
+                            {56, 444, 400, 30},  {56, 480, 400, 30},  {56, 516, 400, 30},
+                            {50, 332, 710, 28},  {56, 552, 400, 30}};
+    for (int i = 0; i < 11; i++) {
         auto c = GetDlgItem(mainWindow, ids[i]);
         MoveWindow(c, S(boxes[i][0]), S(boxes[i][1]), S(boxes[i][2]), S(boxes[i][3]), TRUE);
         SendMessageW(c, WM_SETFONT, (WPARAM)bodyFont, TRUE);
@@ -145,7 +148,8 @@ void SaveSettings() {
     std::string data = "[General]\r\n";
     for (auto item : {std::pair<const char *, HWND>{"Enabled", enabledCheck},
                       {"NotifyFailures", notifyCheck},
-                      {"VerifyBeforeExtract", verifyCheck}})
+                      {"FullPreflight", verifyCheck},
+                      {"RecycleAfterExtract", recycleCheck}})
         data += std::string(item.first) + "=" +
                 (SendMessageW(item.second, BM_GETCHECK, 0, 0) == BST_CHECKED ? "1" : "0") + "\r\n";
     auto file = Join(DataDirectory(), L"settings.ini");
@@ -240,10 +244,12 @@ LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM w, LPARAM l) {
                                32, EnabledCheck);
         notifyCheck = Control(L"BUTTON", L"失败时显示汇总提醒", BS_AUTOCHECKBOX | WS_TABSTOP, 56, 489, 400,
                               32, NotifyCheck);
-        verifyCheck = Control(L"BUTTON", L"写入前校验密码", BS_AUTOCHECKBOX | WS_TABSTOP, 56, 534, 400, 32,
-                              VerifyCheck);
+        verifyCheck = Control(L"BUTTON", L"完整预校验（可选）", BS_AUTOCHECKBOX | WS_TABSTOP, 56, 534, 400,
+                              32, VerifyCheck);
+        recycleCheck = Control(L"BUTTON", L"成功解压后移入回收站", BS_AUTOCHECKBOX | WS_TABSTOP, 56, 552, 400,
+                               30, RecycleCheck);
         for (auto item : {std::pair<int, const wchar_t *>{InstallButton, L"安装接入"},
-                          {RemoveButton, L"恢复原组件"},
+                          {RemoveButton, L"卸载插件"},
                           {RecordsButton, L"查看记录"},
                           {ClearButton, L"清除记录"},
                           {RefreshButton, L"刷新状态"},
@@ -336,6 +342,7 @@ LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM w, LPARAM l) {
         case EnabledCheck:
         case NotifyCheck:
         case VerifyCheck:
+        case RecycleCheck:
             SaveSettings();
             break;
         }

@@ -110,7 +110,9 @@ def main():
     results=[];children=[];key='Software\\BandizipAutoPasswordTests\\integration-'+uuid.uuid4().hex
     env=dict(os.environ,BANDIZIP_RESEARCH_KEY=key,BZAP_DATA_DIR=str(data),BZAP_TRACE=str(work/'trace.txt'),BZAP_NO_UI='1')
     original_hashes={n:sha(source/n) for n in ['Bandizip.exe','ark.x64.dll','bdzshl.x64.dll','data/bzshell.x64.dll']}
-    assert original_hashes['ark.x64.dll']==ORIGINAL,'Unsupported source build'
+    engine=source/'ark.x64.dll'
+    if sha(engine)!=ORIGINAL:engine=source/'ark.bzap-original.x64.dll'
+    assert engine.exists() and sha(engine)==ORIGINAL,'Unsupported source build or backup'
     def check(name,ok,**details):
         results.append(dict(test=name,passed=bool(ok),**details));print(json.dumps(results[-1],ensure_ascii=True),flush=True)
         if not ok:raise AssertionError(name)
@@ -127,7 +129,7 @@ def main():
         try:code=p.wait(timeout=25)
         except subprocess.TimeoutExpired:p.terminate();p.wait(5);check(label+'-no-hang',False)
         file=output/'proof.txt';matches=file.exists() and file.read_bytes()==CONTENT
-        records=history()[before:];check(label,(matches if success else not file.exists()) and code<0x80000000,exit=code,records=records)
+        records=history()[before:];check(label,(matches if success else not matches) and code<0x80000000,exit=code,records=records)
         if not success:check(label+'-reported',any(r['outcome'].startswith('password') and r['archive'].endswith(archive) for r in records))
         if not success:check(label+'-not-success',not any(r['outcome']=='success' for r in records))
         if not success:check(label+'-archive-preserved',(fixtures/archive).exists())
@@ -135,6 +137,7 @@ def main():
     try:
         for n in ['Bandizip.exe','bz.exe','ark.x64.dll','ark.x64.lgpl.dll','bdzshl.x64.dll','config.ini','VersionNo.ini']:
             if (source/n).exists():shutil.copy2(source/n,app/n)
+        shutil.copy2(engine,app/'ark.x64.dll')
         for n in ['data','langs','icons','shellicons']:
             if (source/n).exists():shutil.copytree(source/n,app/n)
         r=run([args.zig,'c++','-target','x86_64-windows-gnu','-march=x86_64','-O2','-static','-shared',ROOT/'tests/isolate.cpp','-ladvapi32','-o',app/'isolate.dll'],timeout=120);assert r.returncode==0,r.stderr.decode(errors='replace')
@@ -161,9 +164,30 @@ def main():
         encrypted_zip(fixtures/'collision.zip','fixture-secret',collision=PASSWORDS[0])
         for name,password in [('header.7z','fixture-secret'),('unknown-header.7z','not-saved-'+uuid.uuid4().hex),('unicode.7z',PASSWORDS[-1])]:
             r=run([source/'bz.exe','c','-fmt:7z','-p:'+password,fixtures/name,fixtures/'proof.txt']);check('create-'+name,r.returncode==0)
+        # Legacy implicit preflight must not silently enable two decompressions.
+        settings=data/'settings.ini';settings.write_text('[General]\nVerifyBeforeExtract=1\n','utf8')
+        start=len(trace())
         extract('plain','plain.zip',True);extract('saved-later','saved.zip',True);extract('all-wrong','unknown.zip',False)
+        check('default-single-pass','VERIFY_BEFORE_EXTRACT' not in trace()[start:])
         extract('header-saved','header.7z',True);extract('header-all-wrong','unknown-header.7z',False);extract('unicode-password','unicode.7z',True)
+        before=len(trace());extract('zip-collision-adaptive','collision.zip',True)
+        check('collision-retries-failed-item','VERIFY_FAILED_ITEM_ONLY' in trace()[before:] and 'VERIFY_BEFORE_EXTRACT' not in trace()[before:])
+        with zipfile.ZipFile(fixtures/'before.zip','w') as z:z.writestr('first.txt',CONTENT)
+        mixed_retry=fixtures/'adaptive.zip'
+        merge_zip(mixed_retry,[(fixtures/'before.zip').read_bytes(),
+                  (fixtures/'collision.zip').read_bytes().replace(b'proof.txt',b'error.txt'),
+                  (fixtures/'saved.zip').read_bytes().replace(b'proof.txt',b'after.txt')])
+        for selected in [False,True]:
+            out=work/('adaptive-selected' if selected else 'adaptive-all');before=len(history())
+            r=run([app/'Bandizip.exe','x','-y','-aou','-o:'+str(out),mixed_retry,*(['first.txt','error.txt'] if selected else [])])
+            expected={'first.txt','error.txt'} if selected else {'first.txt','error.txt','after.txt'}
+            check('adaptive-resume-selected' if selected else 'adaptive-does-not-duplicate-output',
+                  r.returncode<0x80000000 and {p.name for p in out.iterdir()}==expected and
+                  all((out/name).read_bytes()==CONTENT for name in expected) and
+                  any(record['outcome']=='success' and record['completed_files']==len(expected) for record in history()[before:]))
+        settings.write_text('[General]\nFullPreflight=1\n','utf8')
         before=len(trace());extract('zip-header-collision','collision.zip',True);check('collision-full-validation','RETRY_AFTER_PASSWORD_OR_CRC_ERROR' in trace()[before:])
+        settings.write_text('[General]\nFullPreflight=0\n','utf8')
         out=work/'batch';before=len(history());files=['saved.zip','unknown.zip','unknown-header.7z','header.7z']
         r=run([app/'Bandizip.exe','bx','-y','-target:name','-o:'+str(out),*[fixtures/n for n in files]])
         outputs={n:(out/Path(n).stem/'proof.txt').exists() for n in files};check('batch-continues',outputs==dict(zip(files,[True,False,False,True])),outputs=outputs,records=history()[before:])
@@ -195,35 +219,49 @@ def main():
         # Extracting one selected file must not require the other file's password.
         raw=(fixtures/'saved.zip').read_bytes();other=(fixtures/'unknown.zip').read_bytes().replace(b'proof.txt',b'other.txt')
         mixed=fixtures/'mixed.zip';merge_zip(mixed,[raw,other])
-        out=work/'selected-only';r=run([app/'Bandizip.exe','x','-y','-o:'+str(out),mixed,'proof.txt'])
-        check('selected-file-only',r.returncode<0x80000000 and (out/'proof.txt').read_bytes()==CONTENT and not (out/'other.txt').exists())
+        out=work/'selected-only';before=len(history());r=run([app/'Bandizip.exe','x','-y','-o:'+str(out),mixed,'proof.txt'])
+        check('selected-file-only',r.returncode<0x80000000 and (out/'proof.txt').read_bytes()==CONTENT and not (out/'other.txt').exists()
+              and any(record['outcome']=='success' and record['completed_files']==1 for record in history()[before:])
+              and not any(record['outcome']!='success' for record in history()[before:]))
+        settings.write_text('[General]\nFullPreflight=1\n','utf8')
+        out=work/'selected-preflight';before=len(history());r=run([app/'Bandizip.exe','x','-y','-o:'+str(out),mixed,'proof.txt'])
+        check('selected-preflight-preserved',r.returncode<0x80000000 and (out/'proof.txt').read_bytes()==CONTENT and
+              not (out/'other.txt').exists() and all(record['outcome']=='success' for record in history()[before:]))
+        settings.write_text('[General]\nFullPreflight=0\n','utf8')
         encrypted_zip(fixtures/'second-known.zip','password');other=(fixtures/'second-known.zip').read_bytes().replace(b'proof.txt',b'other.txt');mixed=fixtures/'mixed-known.zip';merge_zip(mixed,[raw,other])
         out=work/'multiple-passwords';r=run([app/'Bandizip.exe','x','-y','-o:'+str(out),mixed])
         check('different-passwords-in-one-zip',r.returncode<0x80000000 and all((out/n).exists() and (out/n).read_bytes()==CONTENT for n in ['proof.txt','other.txt']))
         # A valid password plus corrupted data must not produce a confident
         # "wrong password" diagnosis or write any unverified output.
         bad=bytearray(raw);bad[40+len(CONTENT)]^=1;(fixtures/'damaged.zip').write_bytes(bad)
+        settings.write_text('[General]\nFullPreflight=1\n','utf8')
         records=extract('damaged-data','damaged.zip',False)
         check('damaged-data-qualified',any(r['outcome']=='password_or_data_error' for r in records))
+        check('full-preflight-keeps-invalid-output-unwritten',not (work/'damaged-data/proof.txt').exists())
+        settings.write_text('[General]\nFullPreflight=0\n','utf8')
+        from batch_integration import run_batch_tests
+        run_batch_tests(app,source,work,data,run,check,history,trace)
+        from recycle_integration import run_recycle_tests
+        run_recycle_tests(app,source,fixtures,work,data,args.zig,run,check,history,trace)
         r,removed=manage('--uninstall');check('uninstall',r.returncode==0 and removed['ok']);check('original-restored',sha(app/'ark.x64.dll')==ORIGINAL)
         # A damaged original is never replaced, and missing-engine recovery uses
         # only the previously verified backup.
         with (app/'ark.x64.dll').open('ab') as f:f.write(b'test overlay')
         r,result=manage('--install');check('unsupported-engine-refused',not result['ok'])
-        shutil.copy2(source/'ark.x64.dll',app/'ark.x64.dll');r,result=manage('--install');check('reinstall-after-restore',result['ok'])
+        shutil.copy2(engine,app/'ark.x64.dll');r,result=manage('--install');check('reinstall-after-restore',result['ok'])
         missing=app/'ark.interrupted-install-test.dll';(app/'ark.x64.dll').rename(missing)
         r,result=manage('--install');check('missing-engine-recovery',result['ok'])
         r,result=manage('--uninstall');check('recovered-uninstall',result['ok'] and sha(app/'ark.x64.dll')==ORIGINAL)
         r,result=manage('--install');assert result['ok']
         backup=app/'ark.bzap-original.x64.dll';backup.write_bytes(backup.read_bytes()+b'bad-backup-test');current=sha(app/'ark.x64.dll')
         r,result=manage('--uninstall');check('damaged-backup-refused',not result['ok'] and sha(app/'ark.x64.dll')==current)
-        shutil.copy2(source/'ark.x64.dll',backup)
-        shutil.copy2(source/'ark.x64.dll',app/'ark.x64.dll')
+        shutil.copy2(engine,backup)
+        shutil.copy2(engine,app/'ark.x64.dll')
         with (app/'ark.x64.dll').open('ab') as f:f.write(b'new-version-simulation')
         newer=sha(app/'ark.x64.dll');r,result=manage('--uninstall');check('uninstall-preserves-new-engine',result['ok'] and sha(app/'ark.x64.dll')==newer)
         check('live-files-unchanged',original_hashes=={n:sha(source/n) for n in original_hashes})
         logged=(data/'history.jsonl').read_text('utf8')
-        allowed={'time','pid','archive','outcome','error','attempts','saved_password_count','completed_files','opening'}
+        allowed={'time','pid','archive','outcome','error','attempts','saved_password_count','completed_files','opening','source_volumes','recycled_volumes'}
         check('no-passwords-in-history',not any(p in logged for p in PASSWORDS if p!='password') and all(set(r)<=allowed for r in history()))
     finally:
         for p in children:

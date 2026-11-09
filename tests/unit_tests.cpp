@@ -1,5 +1,6 @@
 #include "common.hpp"
 #include "password_store.hpp"
+#include "recycle.hpp"
 #include <cstdio>
 #include <mbedtls/blowfish.h>
 #include <string>
@@ -110,7 +111,54 @@ int wmain() {
     Check(FileHash(path) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
           "SHA256 reference");
     Check(!EnsureDirectory(path), "reject file as directory");
+    SourceFile original;
+    Check(CaptureSource(path, original), "source identity capture");
+    Check(SameSource(original), "unchanged source accepted");
+    Check(AtomicWrite(path, "replaced"), "replace fixture");
+    Check(!SameSource(original), "replaced source rejected");
+    Check(!CaptureSource(Directory(path), original), "directory is not recyclable source");
+    Check(!CaptureSource(L"\\\\server\\share\\archive.zip", original), "network source rejected");
     DeleteFileW(path.c_str());
+    auto settingsDirectory = path + L"-settings";
+    EnsureDirectory(settingsDirectory);
+    wchar_t oldData[32768];
+    DWORD oldDataLength = GetEnvironmentVariableW(L"BZAP_DATA_DIR", oldData, 32768);
+    SetEnvironmentVariableW(L"BZAP_DATA_DIR", settingsDirectory.c_str());
+    auto settingsFile = Join(settingsDirectory, L"settings.ini");
+    Check(!LoadSettings().verify && !LoadSettings().recycle, "single pass and keep archives by default");
+    AtomicWrite(settingsFile, "[General]\nVerifyBeforeExtract=1\n");
+    Check(!LoadSettings().verify, "legacy implicit preflight is not inherited");
+    AtomicWrite(settingsFile, "[General]\nFullPreflight=1\nRecycleAfterExtract=1\n");
+    Check(LoadSettings().verify && LoadSettings().recycle, "explicit extraction preferences");
+    SetEnvironmentVariableW(L"BZAP_DATA_DIR", oldDataLength && oldDataLength < 32768 ? oldData : nullptr);
+    DeleteFileW(settingsFile.c_str());
+    RemoveDirectoryW(settingsDirectory.c_str());
+
+    const unsigned char header[] = {0x37, 0x7a, 0xbc, 0xaf, 0x27, 0x1c, 0, 4, 0xef, 0x50, 0xd7,
+                                    0x23, 0x60, 0,    0,    0,    0,    0, 0, 0,    4,    0,
+                                    0,    0,    0,    0,    0,    0,    0, 0, 0,    0};
+    std::vector<SourceFile> volumes;
+    for (int i = 1; i <= 4; ++i) {
+        auto part = path + L".7z.00" + std::to_wstring(i);
+        std::string bytes(i <= 2 ? 64 : 4, 'x');
+        if (i == 1)
+            memcpy(bytes.data(), header, sizeof(header));
+        AtomicWrite(part, bytes);
+        SourceFile file;
+        Check(CaptureSource(part, file), "split fixture identity");
+        volumes.push_back(file);
+    }
+    auto bounded = volumes;
+    Check(TrimSplitSources(1, volumes[0].path, bounded) && bounded.size() == 3,
+          "7z next numbered decoy excluded");
+    bounded = {volumes[0], volumes[1]};
+    Check(!TrimSplitSources(1, volumes[0].path, bounded), "7z incomplete volume set refused");
+    AtomicWrite(volumes[0].path, std::string(64, 'x'));
+    CaptureSource(volumes[0].path, volumes[0]);
+    bounded = volumes;
+    Check(!TrimSplitSources(1, volumes[0].path, bounded), "unrecognized numbered archive kept");
+    for (const auto &volume : volumes)
+        DeleteFileW(volume.path.c_str());
     Check(Wide(Utf8(L"测试🔑")) == L"测试🔑", "UTF-8 round trip");
     printf("PASS %d checks\n", checks);
     return 0;
