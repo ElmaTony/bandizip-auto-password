@@ -1,4 +1,5 @@
 #include "common.hpp"
+#include "output_snapshot.hpp"
 #include "password_store.hpp"
 #include "recycle.hpp"
 #include <cstdio>
@@ -118,6 +119,14 @@ int wmain() {
     Check(!SameSource(original), "replaced source rejected");
     Check(!CaptureSource(Directory(path), original), "directory is not recyclable source");
     Check(!CaptureSource(L"\\\\server\\share\\archive.zip", original), "network source rejected");
+    DeleteFileW(path.c_str());
+    OutputSnapshot output;
+    Check(CaptureOutput(path, output) && !output.existed && SameOutput(output), "removed output can be retried");
+    AtomicWrite(path, "new unrelated output");
+    Check(!SameOutput(output), "new output after absence is protected");
+    Check(CaptureOutput(path, output) && output.existed && SameOutput(output), "partial output identity captured");
+    AtomicWrite(path, "replacement");
+    Check(!SameOutput(output), "replaced partial output is protected");
     DeleteFileW(path.c_str());
     auto settingsDirectory = path + L"-settings";
     EnsureDirectory(settingsDirectory);

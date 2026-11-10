@@ -68,7 +68,7 @@ InstallResult Failure(const std::wstring &message, DWORD code = 0) {
     return {false, code, message + L"\n" + SystemError(code)};
 }
 bool SaveManifest(const std::wstring &dir, const std::string &proxy) {
-    auto body = "[Installation]\r\nProduct=BandizipAutoPassword\r\nVersion=1.2.0\r\nEngineVersion=7.47.0."
+    auto body = "[Installation]\r\nProduct=BandizipAutoPassword\r\nVersion=1.2.1\r\nEngineVersion=7.47.0."
                 "1\r\nOriginalSHA256=" +
                 std::string(SupportedArkSha256) + "\r\nProxySHA256=" + proxy +
                 "\r\nInstalledUTC=" + UtcNow() + "\r\n";

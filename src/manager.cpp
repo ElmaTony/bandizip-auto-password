@@ -107,7 +107,7 @@ void DrawScene(HDC dc) {
                                   LR_SHARED);
     DrawIconEx(dc, S(32), S(30), icon, S(48), S(48), 0, nullptr, DI_NORMAL);
     Text(dc, L"Bandizip 自动密码", Rect(96, 25, 600, 42), titleFont, Ink);
-    Text(dc, L"AUTO PASSWORD  /  1.2", Rect(97, 69, 550, 22), smallFont, Muted);
+    Text(dc, std::wstring(L"AUTO PASSWORD  /  ") + ProductVersion, Rect(97, 69, 550, 22), smallFont, Muted);
     Card(dc, Rect(32, 120, 856, 142), RGB(255, 255, 255));
     Card(dc, Rect(56, 145, 5, 86), installStatus.supported ? Accent : RGB(210, 143, 51));
     Text(dc, statusTitle, Rect(78, 141, 620, 28), headingFont, Ink);

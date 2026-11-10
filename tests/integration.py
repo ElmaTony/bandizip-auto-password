@@ -63,19 +63,26 @@ class ZipCrypto:
         for v in data:v^=self.mask();out.append(v);self.update(v)
         return out
 
-def encrypted_zip(path,password,collision=None):
+def encrypted_zip(path,password,collision=None,method=0,filename='proof.txt'):
     crc=zlib.crc32(CONTENT)
+    payload=CONTENT
+    if method==8:
+        compressor=zlib.compressobj(wbits=-15)
+        payload=compressor.compress(CONTENT)+compressor.flush()
     for _ in range(100000):
-        header=os.urandom(11)+bytes([crc>>24]);enc=ZipCrypto(password).encrypt(header+CONTENT)
+        header=os.urandom(11)+bytes([crc>>24]);enc=ZipCrypto(password).encrypt(header+payload)
         if collision is None:break
         decoded=ZipCrypto(collision).decrypt(enc)
-        if decoded[11]==crc>>24 and zlib.crc32(decoded[12:])!=crc:break
+        # For Deflate, force an invalid block type after a valid password-header
+        # collision. The native decoder then removes its failed output.
+        invalid = ((decoded[12] >> 1) & 3) == 3 if method==8 else zlib.crc32(decoded[12:])!=crc
+        if decoded[11]==crc>>24 and invalid:break
     else:raise AssertionError('could not create deterministic-condition collision fixture')
-    name=b'proof.txt';size=len(enc);flags=0x801
-    local=struct.pack('<IHHHHHIIIHH',0x04034b50,20,flags,0,0,0,crc,size,len(CONTENT),len(name),0)+name+enc
-    central=struct.pack('<IHHHHHHIIIHHHHHII',0x02014b50,20,20,flags,0,0,0,crc,size,len(CONTENT),len(name),0,0,0,0,0,0)+name
+    name=filename.encode('utf8');size=len(enc);flags=0x801
+    local=struct.pack('<IHHHHHIIIHH',0x04034b50,20,flags,method,0,0,crc,size,len(CONTENT),len(name),0)+name+enc
+    central=struct.pack('<IHHHHHHIIIHHHHHII',0x02014b50,20,20,flags,method,0,0,crc,size,len(CONTENT),len(name),0,0,0,0,0,0)+name
     path.write_bytes(local+central+struct.pack('<IHHHHIIH',0x06054b50,0,0,1,1,len(central),len(local),0))
-    with zipfile.ZipFile(path) as z:assert z.read('proof.txt',pwd=password.encode())==CONTENT
+    with zipfile.ZipFile(path) as z:assert z.read(filename,pwd=password.encode())==CONTENT
 
 def delete_key(parent,name):
     try:
@@ -185,6 +192,26 @@ def main():
                   r.returncode<0x80000000 and {p.name for p in out.iterdir()}==expected and
                   all((out/name).read_bytes()==CONTENT for name in expected) and
                   any(record['outcome']=='success' and record['completed_files']==len(expected) for record in history()[before:]))
+        # A failed Deflate decoder can delete the output before retry. Include a
+        # completed file and an explicit directory, then check both extraction
+        # scopes under auto-rename so duplicate outputs cannot go unnoticed.
+        encrypted_zip(fixtures/'deflate-collision.zip','fixture-secret',collision=PASSWORDS[0],method=8,filename='folder/error.txt')
+        with zipfile.ZipFile(fixtures/'directory.zip','w') as z:z.writestr('folder/',b'')
+        removed_retry=fixtures/'removed-output.zip'
+        merge_zip(removed_retry,[(fixtures/'before.zip').read_bytes(),(fixtures/'directory.zip').read_bytes(),
+                  (fixtures/'deflate-collision.zip').read_bytes(),
+                  (fixtures/'saved.zip').read_bytes().replace(b'proof.txt',b'after.txt')])
+        for selected in [False,True]:
+            label='removed-output-selected' if selected else 'removed-output-all'
+            out=work/label;before=len(history());trace_start=len(trace())
+            r=run([app/'Bandizip.exe','x','-y','-aou','-o:'+str(out),removed_retry,*(['first.txt','folder/error.txt'] if selected else [])])
+            expected={'first.txt','folder/error.txt'} if selected else {'first.txt','folder/error.txt','after.txt'}
+            actual={p.relative_to(out).as_posix() for p in out.rglob('*') if p.is_file()}
+            records=history()[before:];observed=trace()[trace_start:]
+            check(label,r.returncode<0x80000000 and actual==expected and
+                  all((out/name).read_bytes()==CONTENT for name in expected) and
+                  bool(records) and all(record['outcome']=='success' for record in records))
+            check(label+'-retried','RETRY_REMOVED_OUTPUT' in observed and 'VERIFY_BEFORE_EXTRACT' not in observed)
         settings.write_text('[General]\nFullPreflight=1\n','utf8')
         before=len(trace());extract('zip-header-collision','collision.zip',True);check('collision-full-validation','RETRY_AFTER_PASSWORD_OR_CRC_ERROR' in trace()[before:])
         settings.write_text('[General]\nFullPreflight=0\n','utf8')
@@ -203,7 +230,12 @@ def main():
             r=run([host,app,archive,key,mode,'智能解压到此处'])
             outputs=list(folder.rglob('proof.txt'))
             check('native-'+mode,r.returncode==0 and any(p.read_bytes()==CONTENT for p in outputs),exit=r.returncode,native_trace=r.stdout.decode('utf8',errors='replace')[-2200:])
-        before=len(trace());r=run([driver,app,fixtures/'header.7z',key,'open']);time.sleep(.7);opened=trace()[before:]
+        before=len(trace());r=run([driver,app,fixtures/'header.7z',key,'open'])
+        deadline=time.monotonic()+15
+        while True:
+            opened=trace()[before:]
+            if 'OPEN_SUCCEEDED' in opened or 'OPEN_FAILED' in opened or time.monotonic()>=deadline:break
+            time.sleep(.1)
         open_pids={int(line.split(' ',1)[0]) for line in opened.splitlines() if 'SUPPORTED_BUILD_ENABLED' in line}
         for pid in open_pids:close_test_process(pid,app/'Bandizip.exe')
         check('shell-open-header-archive',r.returncode==0 and 'OPEN_SUCCEEDED' in opened and 'TRY_SAVED index=4' in opened)

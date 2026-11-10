@@ -1,5 +1,6 @@
 #include "ark_abi.hpp"
 #include "common.hpp"
+#include "output_snapshot.hpp"
 #include "password_store.hpp"
 #include "recycle.hpp"
 #include "reporting.hpp"
@@ -115,7 +116,7 @@ struct Context {
     std::unordered_set<const ark::FileItem *> requiredItems, writtenItems;
     std::unordered_set<const ark::FileItem *> successfulItems, retryItems;
     std::unordered_map<const ark::FileItem *, std::wstring> outputPaths;
-    std::unordered_map<const ark::FileItem *, SourceFile> retryOutputs;
+    std::unordered_map<const ark::FileItem *, OutputSnapshot> retryOutputs;
     bool canResume = false;
     std::vector<int> selection;
     std::atomic<bool> recycleBlocked{false};
@@ -494,10 +495,10 @@ struct EventProxy : ark::Events {
             std::lock_guard<std::mutex> guard(context->mutex);
             auto retry = context->retryOutputs.find(item);
             if (retry != context->retryOutputs.end()) {
-                if (!SameSource(retry->second)) {
+                if (!SameOutput(retry->second)) {
                     all = TRUE;
                 } else
-                    output.Set(retry->second.path.c_str());
+                    output.Set(retry->second.file.path.c_str());
             }
             context->outputPaths[item] = output.name;
         }
@@ -612,7 +613,8 @@ struct EventProxy : ark::Events {
             std::lock_guard<std::mutex> guard(context->mutex);
             auto retry = context->retryOutputs.find(item);
             if (retry != context->retryOutputs.end()) {
-                mode = path && _wcsicmp(path, retry->second.path.c_str()) == 0 && SameSource(retry->second)
+                mode = retry->second.existed && path &&
+                               _wcsicmp(path, retry->second.file.path.c_str()) == 0 && SameOutput(retry->second)
                            ? 0
                            : 3;
                 if (mode == 3) {
@@ -976,18 +978,19 @@ int Execute(void *object, const std::function<int()> &extract,
             remaining.push_back(index);
             if (!failed.count(item))
                 continue;
-            SourceFile output;
+            OutputSnapshot output;
             auto name = c->outputPaths.find(item);
-            // Only replace the exact output left by this failed attempt. If it
-            // has been renamed/replaced or its identity cannot be captured,
-            // preserve it and report the error instead of overwriting blindly.
-            if (name == c->outputPaths.end() || !CaptureSource(name->second, output)) {
+            // Retry either the exact partial output or a path the decoder has
+            // removed. Both states must remain unchanged through validation.
+            if (name == c->outputPaths.end() || !CaptureOutput(name->second, output)) {
                 verified = false;
                 break;
             }
             c->plans[item].confirmed = -1;
             c->ClearEnginePassword();
             Trace(L"VERIFY_FAILED_ITEM_ONLY index=" + std::to_wstring(index));
+            if (!output.existed)
+                Trace(L"RETRY_REMOVED_OUTPUT");
             verified = Verify(c, [&](ark::Output *sink) {
                 return ark::Method<int(WINAPI *)(void *, int, ark::Output *)>(c->original, 25)(object, index,
                                                                                                sink);
