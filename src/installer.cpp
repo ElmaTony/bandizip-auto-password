@@ -68,11 +68,43 @@ InstallResult Failure(const std::wstring &message, DWORD code = 0) {
     return {false, code, message + L"\n" + SystemError(code)};
 }
 bool SaveManifest(const std::wstring &dir, const std::string &proxy) {
-    auto body = "[Installation]\r\nProduct=BandizipAutoPassword\r\nVersion=1.2.1\r\nEngineVersion=7.47.0."
-                "1\r\nOriginalSHA256=" +
+    auto body = "[Installation]\r\nProduct=BandizipAutoPassword\r\nVersion=" + Utf8(ProductVersion) +
+                "\r\nEngineVersion=7.47.0.1\r\nOriginalSHA256=" +
                 std::string(SupportedArkSha256) + "\r\nProxySHA256=" + proxy +
                 "\r\nInstalledUTC=" + UtcNow() + "\r\n";
     return AtomicWrite(Manifest(dir), body);
+}
+void CleanRetired(const std::wstring &directory) {
+    auto folder = Join(directory, L"AutoPassword");
+    WIN32_FIND_DATAW data{};
+    HANDLE search = FindFirstFileW(Join(folder, L"*.dll").c_str(), &data);
+    if (search == INVALID_HANDLE_VALUE) return;
+    do {
+        if (data.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) continue;
+        std::wstring name = data.cFileName;
+        bool owned = false;
+        for (auto prefix : {L"retired-", L"retired-proxy-", L"uncommitted-"}) {
+            size_t start = wcslen(prefix), end = name.size() - 4;
+            if (name.compare(0, start, prefix) || start >= end) continue;
+            bool numeric = true;
+            for (size_t i = start; i < end; ++i) numeric = numeric && name[i] >= L'0' && name[i] <= L'9';
+            owned = owned || numeric;
+        }
+        if (!owned) continue;
+        // Delete through the checked handle. Loaded or otherwise locked files
+        // remain available and are retried after the next successful operation.
+        HANDLE file = CreateFileW(Join(folder, name).c_str(), DELETE | FILE_READ_ATTRIBUTES, 0, nullptr,
+                                  OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (file == INVALID_HANDLE_VALUE) continue;
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (GetFileInformationByHandle(file, &info) &&
+            !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
+            FILE_DISPOSITION_INFO remove{TRUE};
+            SetFileInformationByHandle(file, FileDispositionInfo, &remove, sizeof(remove));
+        }
+        CloseHandle(file);
+    } while (FindNextFileW(search, &data));
+    FindClose(search);
 }
 } // namespace
 InstallStatus GetInstallStatus(const std::wstring &directory, const std::wstring &packageDirectory) {
@@ -89,8 +121,15 @@ InstallStatus GetInstallStatus(const std::wstring &directory, const std::wstring
     bool recovery = out.backupValid && !Exists(engine);
     out.supported = out.version == L"7.47.0.1" && IsAmd64Image(app) &&
                     (out.installed || currentHash == SupportedArkSha256 || recovery);
+    if (out.installed) {
+        out.installedVersion = currentHash == PackageSha256 ? ProductVersion : Ini(Manifest(out.directory), L"Version");
+        if (out.installedVersion.empty()) out.installedVersion = L"未知版本";
+        out.updateAvailable = out.supported && currentHash != PackageSha256;
+    }
     if (out.installed && !out.supported)
         out.detail = L"Bandizip 版本已变化，自动匹配已停用，请卸载插件";
+    else if (out.updateAvailable)
+        out.detail = L"已安装 " + out.installedVersion + L"，可更新到 " + ProductVersion;
     else if (out.installed)
         out.detail = L"自动密码扩展已安装";
     else if (recovery && out.supported)
@@ -157,6 +196,7 @@ InstallResult Install(const std::wstring &directory, const std::wstring &package
         MoveFileExW(retired.c_str(), engine.c_str(), MOVEFILE_WRITE_THROUGH);
         return Failure(L"安装记录未能保存，已尝试恢复原组件");
     }
+    CleanRetired(dir);
     return {true, 0, L"已安装。以后照常双击或使用原来的右键菜单解压即可。\n无需启动管理器或后台助手。"};
 }
 InstallResult Uninstall(const std::wstring &directory) {
@@ -182,6 +222,7 @@ InstallResult Uninstall(const std::wstring &directory) {
             return Failure(L"恢复缺失的引擎失败");
         MoveFileExW(manifest.c_str(), Join(Directory(manifest), L"installation.inactive.ini").c_str(),
                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+        CleanRetired(dir);
         return {true, 0, L"已从校验通过的备份恢复原版解压引擎。"};
     }
     if (current != proxyHash) {
@@ -193,6 +234,7 @@ InstallResult Uninstall(const std::wstring &directory) {
         if (!MoveFileExW(manifest.c_str(), inactive.c_str(),
                          MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
             return Failure(L"无法停用安装记录");
+        CleanRetired(dir);
         return {true, 0, L"当前引擎已不是此扩展，已保留现有组件并停用扩展记录。"};
     }
     if (FileHash(backup) != SupportedArkSha256)
@@ -218,6 +260,7 @@ InstallResult Uninstall(const std::wstring &directory) {
     }
     MoveFileExW(manifest.c_str(), Join(Directory(manifest), L"installation.inactive.ini").c_str(),
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    CleanRetired(dir);
     return {true, 0,
             L"已卸载插件并恢复原版解压引擎。原密码管理器和文件关联均保留。\n备份及解压记录继续保留，方便核对。"};
 }

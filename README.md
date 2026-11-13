@@ -22,7 +22,7 @@
 2. 关闭 Bandizip，运行 `BandizipAutoPassword.exe`，确认安装目录，点击“安装接入”。按 Windows 提示完成管理员授权。
 3. 关闭管理器，照常解压。密码继续在 Bandizip 自己的密码管理器中维护。
 
-更新扩展：关闭 Bandizip，运行新版管理器并点击“修复接入”。卸载选择“卸载插件”，会恢复原版解压引擎。Bandizip 升级后可能需要重新适配。
+更新扩展：关闭 Bandizip，运行新版管理器，核对已安装版本与安装包版本，点击“更新接入”；同版本重新安装显示“修复接入”。卸载选择“卸载插件”，会恢复原版解压引擎。Bandizip 升级后可能需要重新适配。
 
 完整预校验会额外读取并解压一次选中的加密内容，用于在写出文件前完整检查，开启后耗时增加。升级不会沿用旧版默认开启的预校验。
 
@@ -40,9 +40,10 @@ PowerShell 7、Zig 0.13.0。引擎来自本机 Bandizip 安装，不随项目分
 ./tools/bootstrap-zig.ps1
 ./build.ps1 -Tests -OutputDirectory release
 python -m pip install -r tests/requirements.txt
+python -m unittest discover -s tests -p "test_*.py"
 python tests/integration.py --package release --zig tools/.toolchain/zig-windows-x86_64-0.13.0/zig.exe
 ```
 
-测试使用隔离的应用副本、注册表和虚拟密码。发布前运行 `python tools/privacy_check.py`。验证范围与实现约束见 [审计说明](docs/AUDIT.md)。
+`build.ps1 -Tests` 包含单元和核心流程回归，无需加载原引擎。完整集成测试使用隔离的应用副本、注册表和虚拟密码。发布前运行 `python tools/privacy_check.py`。验证范围与实现约束见 [审计说明](docs/AUDIT.md)。
 
 项目代码采用 MIT 许可证；Mbed TLS Blowfish 采用 Apache-2.0，见 `THIRD_PARTY_NOTICES.txt`。

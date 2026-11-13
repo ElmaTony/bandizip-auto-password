@@ -113,7 +113,8 @@ def close_test_process(pid,executable):
 
 def main():
     ap=argparse.ArgumentParser();ap.add_argument('--zig',required=True);ap.add_argument('--bandizip',default=r'C:\Program Files\Bandizip');ap.add_argument('--work',default=str(ROOT/'build/integration'));ap.add_argument('--package',default=str(ROOT/'dist'));args=ap.parse_args()
-    source=Path(args.bandizip);work=Path(args.work)/uuid.uuid4().hex;work.mkdir(parents=True);app=work/'app';app.mkdir();fixtures=work/'fixtures';fixtures.mkdir();data=work/'data';data.mkdir()
+    args.zig=str(Path(args.zig).resolve());args.package=str(Path(args.package).resolve())
+    source=Path(args.bandizip).resolve();work=Path(args.work).resolve()/uuid.uuid4().hex;work.mkdir(parents=True);app=work/'app';app.mkdir();fixtures=work/'fixtures';fixtures.mkdir();data=work/'data';data.mkdir()
     results=[];children=[];key='Software\\BandizipAutoPasswordTests\\integration-'+uuid.uuid4().hex
     env=dict(os.environ,BANDIZIP_RESEARCH_KEY=key,BZAP_DATA_DIR=str(data),BZAP_TRACE=str(work/'trace.txt'),BZAP_NO_UI='1')
     original_hashes={n:sha(source/n) for n in ['Bandizip.exe','ark.x64.dll','bdzshl.x64.dll','data/bzshell.x64.dll']}
@@ -156,6 +157,8 @@ def main():
         r,install=manage('--install');check('install',r.returncode==0 and install['ok'],result=install)
         check('backup-exact',sha(app/'ark.bzap-original.x64.dll')==ORIGINAL)
         r,install=manage('--install');check('reinstall-idempotent',r.returncode==0 and install['ok'])
+        from installer_integration import run_installer_tests, check_uninstalled
+        run_installer_tests(app,manage,check,sha,ORIGINAL)
         forged=work/'forged-package';forged.mkdir();shutil.copy2(Path(args.package)/'BandizipAutoPassword.exe',forged/'BandizipAutoPassword.exe');shutil.copy2(Path(args.package)/'ark.x64.dll',forged/'ark.x64.dll')
         with (forged/'ark.x64.dll').open('ab') as f:f.write(b'mismatched-package')
         before=sha(app/'ark.x64.dll');result=work/'forged-result.json'
@@ -179,6 +182,17 @@ def main():
         extract('header-saved','header.7z',True);extract('header-all-wrong','unknown-header.7z',False);extract('unicode-password','unicode.7z',True)
         before=len(trace());extract('zip-collision-adaptive','collision.zip',True)
         check('collision-retries-failed-item','VERIFY_FAILED_ITEM_ONLY' in trace()[before:] and 'VERIFY_BEFORE_EXTRACT' not in trace()[before:])
+        extract('long-output/'+'a'*90+'/'+'b'*90,'collision.zip',True)
+        # A retry must respect the native rename/skip decision for an existing
+        # destination and must never overwrite that preexisting file.
+        for archive,policy in [('saved.zip','-aou'),('collision.zip','-aou'),('saved.zip','-aos')]:
+            label=archive.split('.')[0]+policy;out=work/label;out.mkdir()
+            (out/'proof.txt').write_bytes(b'keep existing destination')
+            r=run([app/'Bandizip.exe','x','-y',policy,'-o:'+str(out),fixtures/archive])
+            files=[p.read_bytes() for p in out.rglob('*') if p.is_file()]
+            check('existing-output-'+label,r.returncode<0x80000000 and
+                  (out/'proof.txt').read_bytes()==b'keep existing destination' and
+                  len(files)==(1 if policy=='-aos' else 2) and (policy=='-aos' or CONTENT in files))
         with zipfile.ZipFile(fixtures/'before.zip','w') as z:z.writestr('first.txt',CONTENT)
         mixed_retry=fixtures/'adaptive.zip'
         merge_zip(mixed_retry,[(fixtures/'before.zip').read_bytes(),
@@ -276,6 +290,7 @@ def main():
         from recycle_integration import run_recycle_tests
         run_recycle_tests(app,source,fixtures,work,data,args.zig,run,check,history,trace)
         r,removed=manage('--uninstall');check('uninstall',r.returncode==0 and removed['ok']);check('original-restored',sha(app/'ark.x64.dll')==ORIGINAL)
+        check_uninstalled(app,manage,check)
         # A damaged original is never replaced, and missing-engine recovery uses
         # only the previously verified backup.
         with (app/'ark.x64.dll').open('ab') as f:f.write(b'test overlay')

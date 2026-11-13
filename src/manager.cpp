@@ -1,6 +1,7 @@
 #include "installer.hpp"
 #include "password_store.hpp"
 #include "reporting.hpp"
+#include "viewport.hpp"
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shlobj.h>
@@ -25,6 +26,11 @@ HWND mainWindow, directoryText, enabledCheck, notifyCheck, verifyCheck, recycleC
 HFONT bodyFont, smallFont, titleFont, headingFont;
 HBRUSH whiteBrush;
 UINT dpi = 96;
+int scrollX = 0, scrollY = 0;
+bool updatingViewport = false;
+UINT previewDpi = 0;
+int previewWidth = 0, previewHeight = 0;
+bool previewBottom = false;
 bool preview = false;
 HANDLE elevation = nullptr;
 std::wstring installDirectory, packageDirectory, statusTitle, statusHint, passwordHint;
@@ -79,10 +85,10 @@ void Refresh() {
                            ? L"已保存 " + std::to_wstring(store.passwords.size()) + L" 个不同密码 · 本地读取"
                            : StoreDescription(store.status);
     }
-    statusTitle = installStatus.installed ? (installStatus.supported ? L"已接入 Bandizip" : L"需要重新适配")
+    statusTitle = installStatus.updateAvailable ? L"插件有可用更新" : installStatus.installed ? (installStatus.supported ? L"已接入 Bandizip" : L"需要重新适配")
                   : installStatus.supported ? L"准备就绪"
                                             : L"检查 Bandizip 版本";
-    statusHint = installStatus.installed && installStatus.supported
+    statusHint = installStatus.updateAvailable ? L"点击“更新接入”，完成后关闭管理器即可照常使用。" : installStatus.installed && installStatus.supported
                      ? L"照常打开或右键解压。安装后可以关闭此管理器。"
                  : installStatus.supported ? L"安装一次，以后自动尝试密码管理器中已保存的密码。"
                                            : L"支持 Bandizip 7.47.0.1 x64，请选择兼容的安装目录。";
@@ -92,7 +98,7 @@ void Refresh() {
     SendMessageW(verifyCheck, BM_SETCHECK, settings.verify ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(recycleCheck, BM_SETCHECK, settings.recycle ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowTextW(GetDlgItem(mainWindow, InstallButton),
-                   installStatus.installed ? L"修复接入" : L"安装接入");
+                   installStatus.updateAvailable ? L"更新接入" : installStatus.installed ? L"修复接入" : L"安装接入");
     EnableWindow(GetDlgItem(mainWindow, InstallButton), installStatus.supported && !elevation);
     EnableWindow(GetDlgItem(mainWindow, RemoveButton), installStatus.installed && !elevation);
     InvalidateRect(mainWindow, nullptr, FALSE);
@@ -103,11 +109,15 @@ void DrawScene(HDC dc) {
     auto bg = CreateSolidBrush(Background);
     FillRect(dc, &client, bg);
     DeleteObject(bg);
+    int saved = SaveDC(dc);
+    SetViewportOrgEx(dc, -scrollX, -scrollY, nullptr);
     auto icon = (HICON)LoadImageW(GetModuleHandleW(nullptr), MAKEINTRESOURCEW(101), IMAGE_ICON, S(48), S(48),
                                   LR_SHARED);
     DrawIconEx(dc, S(32), S(30), icon, S(48), S(48), 0, nullptr, DI_NORMAL);
     Text(dc, L"Bandizip 自动密码", Rect(96, 25, 600, 42), titleFont, Ink);
-    Text(dc, std::wstring(L"AUTO PASSWORD  /  ") + ProductVersion, Rect(97, 69, 550, 22), smallFont, Muted);
+    Text(dc, std::wstring(L"安装包 ") + ProductVersion + L"  ·  " +
+                 (installStatus.installed ? L"已安装 " + installStatus.installedVersion : L"未安装"),
+         Rect(97, 69, 770, 22), smallFont, Muted);
     Card(dc, Rect(32, 120, 856, 142), RGB(255, 255, 255));
     Card(dc, Rect(56, 145, 5, 86), installStatus.supported ? Accent : RGB(210, 143, 51));
     Text(dc, statusTitle, Rect(78, 141, 620, 28), headingFont, Ink);
@@ -122,8 +132,10 @@ void DrawScene(HDC dc) {
     Text(dc, L"额外读取并解压一次，增加耗时", Rect(478, 516, 382, 30), smallFont, Muted);
     Text(dc, L"仅完整解压成功；含已确认的分卷", Rect(478, 552, 382, 30), smallFont, Muted);
     Text(dc, L"Windows x64  ·  本地处理  ·  无需常驻助手", Rect(32, 674, 810, 20), smallFont, Muted);
+    RestoreDC(dc, saved);
 }
 HWND Control(const wchar_t *kind, const wchar_t *text, DWORD style, int x, int y, int w, int h, int id) {
+    if (_wcsicmp(kind, L"BUTTON") == 0) style |= BS_NOTIFY;
     auto c = CreateWindowExW(0, kind, text, WS_CHILD | WS_VISIBLE | style, S(x), S(y), S(w), S(h), mainWindow,
                              (HMENU)(INT_PTR)id, GetModuleHandleW(nullptr), nullptr);
     SendMessageW(c, WM_SETFONT, (WPARAM)bodyFont, TRUE);
@@ -138,9 +150,56 @@ void Layout() {
                             {50, 332, 710, 28},  {56, 552, 400, 30}};
     for (int i = 0; i < 11; i++) {
         auto c = GetDlgItem(mainWindow, ids[i]);
-        MoveWindow(c, S(boxes[i][0]), S(boxes[i][1]), S(boxes[i][2]), S(boxes[i][3]), TRUE);
+        MoveWindow(c, S(boxes[i][0]) - scrollX, S(boxes[i][1]) - scrollY, S(boxes[i][2]), S(boxes[i][3]), TRUE);
         SendMessageW(c, WM_SETFONT, (WPARAM)bodyFont, TRUE);
     }
+}
+void UpdateViewport() {
+    if (updatingViewport) return;
+    updatingViewport = true;
+    // Recompute after either scrollbar changes the client area.
+    for (int pass = 0; pass < 3; ++pass) {
+        RECT client; GetClientRect(mainWindow, &client);
+        scrollX = ScrollPosition(scrollX, S(920), client.right);
+        scrollY = ScrollPosition(scrollY, S(714), client.bottom);
+        SCROLLINFO horizontal{sizeof(SCROLLINFO), SIF_RANGE | SIF_PAGE | SIF_POS,
+                              0, S(920) - 1, (UINT)client.right, scrollX, 0};
+        SCROLLINFO vertical{sizeof(SCROLLINFO), SIF_RANGE | SIF_PAGE | SIF_POS,
+                            0, S(714) - 1, (UINT)client.bottom, scrollY, 0};
+        SetScrollInfo(mainWindow, SB_HORZ, &horizontal, TRUE);
+        SetScrollInfo(mainWindow, SB_VERT, &vertical, TRUE);
+    }
+    Layout();
+    InvalidateRect(mainWindow, nullptr, TRUE);
+    updatingViewport = false;
+}
+void Scroll(int bar, int action, int wheel = 0) {
+    SCROLLINFO info{sizeof(SCROLLINFO), SIF_ALL};
+    GetScrollInfo(mainWindow, bar, &info);
+    int position = bar == SB_VERT ? scrollY : scrollX;
+    switch (action) {
+    case SB_LINEUP: position -= S(36); break;
+    case SB_LINEDOWN: position += S(36); break;
+    case SB_PAGEUP: position -= (int)info.nPage; break;
+    case SB_PAGEDOWN: position += (int)info.nPage; break;
+    case SB_THUMBTRACK: case SB_THUMBPOSITION: position = info.nTrackPos; break;
+    case SB_TOP: position = 0; break;
+    case SB_BOTTOM: position = info.nMax; break;
+    default: position -= wheel; break;
+    }
+    (bar == SB_VERT ? scrollY : scrollX) = position;
+    UpdateViewport();
+}
+void RevealControl(HWND control) {
+    RECT box, client;
+    if (!control || !GetWindowRect(control, &box)) return;
+    MapWindowPoints(nullptr, mainWindow, (POINT *)&box, 2);
+    GetClientRect(mainWindow, &client);
+    if (box.left < 0) scrollX += box.left;
+    else if (box.right > client.right) scrollX += box.right - client.right;
+    if (box.top < 0) scrollY += box.top;
+    else if (box.bottom > client.bottom) scrollY += box.bottom - client.bottom;
+    UpdateViewport();
 }
 void SaveSettings() {
     if (preview)
@@ -235,7 +294,7 @@ void ClearRecords() {
 LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM w, LPARAM l) {
     if (msg == WM_CREATE) {
         mainWindow = window;
-        dpi = GetDpiForWindow(window);
+        dpi = preview && previewDpi ? previewDpi : GetDpiForWindow(window);
         MakeFonts();
         whiteBrush = CreateSolidBrush(RGB(255, 255, 255));
         directoryText =
@@ -265,6 +324,14 @@ LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM w, LPARAM l) {
         DrawScene(dc);
         EndPaint(window, &ps);
         return 0;
+    }
+    if (msg == WM_SIZE) { UpdateViewport(); return 0; }
+    if (msg == WM_HSCROLL || msg == WM_VSCROLL) {
+        Scroll(msg == WM_VSCROLL ? SB_VERT : SB_HORZ, LOWORD(w)); return 0;
+    }
+    if (msg == WM_MOUSEWHEEL) {
+        Scroll(GetKeyState(VK_SHIFT) < 0 ? SB_HORZ : SB_VERT, -1,
+               (short)HIWORD(w) * S(72) / WHEEL_DELTA); return 0;
     }
     if (msg == WM_PRINTCLIENT) {
         DrawScene((HDC)w);
@@ -305,9 +372,12 @@ LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM w, LPARAM l) {
         dpi = HIWORD(w);
         MakeFonts();
         auto r = (RECT *)l;
-        SetWindowPos(window, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top,
+        MONITORINFO monitor{sizeof(MONITORINFO)};
+        GetMonitorInfoW(MonitorFromRect(r, MONITOR_DEFAULTTONEAREST), &monitor);
+        auto fitted = FitWindow(*r, monitor.rcWork);
+        SetWindowPos(window, nullptr, fitted.left, fitted.top, fitted.right - fitted.left, fitted.bottom - fitted.top,
                      SWP_NOZORDER | SWP_NOACTIVATE);
-        Layout();
+        UpdateViewport();
         InvalidateRect(window, nullptr, TRUE);
         return 0;
     }
@@ -319,6 +389,10 @@ LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM w, LPARAM l) {
         return 0;
     }
     if (msg == WM_COMMAND) {
+        if (HIWORD(w) == BN_SETFOCUS || HIWORD(w) == EN_SETFOCUS) {
+            RevealControl((HWND)l); return 0;
+        }
+        if (HIWORD(w) != BN_CLICKED) return 0;
         switch (LOWORD(w)) {
         case InstallButton:
             Manage(true);
@@ -415,6 +489,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         std::wstring arg = argv[i];
         if (arg == L"--preview")
             preview = true;
+        else if (arg == L"--preview-dpi" && i + 1 < argc)
+            previewDpi = (UINT)std::clamp(_wtoi(argv[++i]), 96, 288);
+        else if (arg == L"--preview-size" && i + 2 < argc) {
+            previewWidth = std::max(320, _wtoi(argv[++i]));
+            previewHeight = std::max(240, _wtoi(argv[++i]));
+        } else if (arg == L"--preview-bottom") previewBottom = true;
         else if (arg == L"--render-preview" && i + 1 < argc) {
             preview = true;
             render = argv[++i];
@@ -441,6 +521,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         auto text = "{\"supported\":" + std::string(s.supported ? "true" : "false") +
                     ",\"installed\":" + (s.installed ? "true" : "false") +
                     ",\"backup_valid\":" + (s.backupValid ? "true" : "false") +
+                    ",\"installed_version\":" + Json(s.installedVersion) +
+                    ",\"package_version\":" + Json(ProductVersion) +
+                    ",\"update_available\":" + (s.updateAvailable ? "true" : "false") +
                     ",\"version\":" + Json(s.version) + ",\"detail\":" + Json(s.detail) + "}";
         if (!output.empty() && !AtomicWrite(output, text))
             return (int)GetLastError();
@@ -466,16 +549,26 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     cls.hIcon = LoadIconW(instance, MAKEINTRESOURCEW(101));
     RegisterClassW(&cls);
-    dpi = GetDpiForSystem();
+    dpi = previewDpi && preview ? previewDpi : GetDpiForSystem();
     RECT size = Rect(0, 0, 920, 714);
-    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+    DWORD style = WS_OVERLAPPEDWINDOW;
     AdjustWindowRectExForDpi(&size, style, FALSE, 0, dpi);
+    POINT cursor{}; GetCursorPos(&cursor);
+    MONITORINFO monitor{sizeof(MONITORINFO)};
+    GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST), &monitor);
+    RECT position{monitor.rcWork.left, monitor.rcWork.top,
+                  monitor.rcWork.left + size.right - size.left, monitor.rcWork.top + size.bottom - size.top};
+    if (render.empty()) position = FitWindow(position, monitor.rcWork);
+    if (preview && previewWidth && previewHeight) {
+        position.right = position.left + previewWidth; position.bottom = position.top + previewHeight;
+    }
     auto window =
-        CreateWindowExW(0, cls.lpszClassName, L"Bandizip 自动密码", style, CW_USEDEFAULT, CW_USEDEFAULT,
-                        size.right - size.left, size.bottom - size.top, nullptr, nullptr, instance, nullptr);
+        CreateWindowExW(0, cls.lpszClassName, L"Bandizip 自动密码", style, position.left, position.top,
+                        position.right - position.left, position.bottom - position.top, nullptr, nullptr, instance, nullptr);
     if (!window)
         return 1;
     if (!render.empty()) {
+        if (previewBottom) { scrollY = S(714); UpdateViewport(); }
         bool ok = RenderPreview(render);
         DestroyWindow(window);
         return ok ? 0 : 1;

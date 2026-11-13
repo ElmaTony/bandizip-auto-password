@@ -35,6 +35,10 @@ try {
         if ($LASTEXITCODE -ne 0) { throw '单元测试构建失败。' }
         & (Join-Path $root 'build/unit_tests.exe')
         if ($LASTEXITCODE -ne 0) { throw '单元测试失败。' }
+        & $ZigPath c++ @flags -municode '-Isrc' 'tests/core_tests.cpp' @common 'build/manager.res' @libraries -o 'build/core_tests.exe'
+        if ($LASTEXITCODE -ne 0) { throw '核心流程测试构建失败。' }
+        & (Join-Path $root 'build/core_tests.exe')
+        if ($LASTEXITCODE -ne 0) { throw '核心流程测试失败。' }
     }
     foreach ($name in @('README.md','THIRD_PARTY_NOTICES.txt','LICENSE')) { if (Test-Path -LiteralPath (Join-Path $root $name)) { Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $dist $name) -Force } }
     Copy-Item -LiteralPath (Join-Path $root 'third_party/mbedtls/LICENSE') -Destination (Join-Path $dist 'MbedTLS-LICENSE.txt') -Force

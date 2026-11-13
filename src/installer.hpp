@@ -7,8 +7,8 @@ struct InstallResult {
     std::wstring message;
 };
 struct InstallStatus {
-    std::wstring directory, version;
-    bool supported = false, installed = false, backupValid = false;
+    std::wstring directory, version, installedVersion;
+    bool supported = false, installed = false, backupValid = false, updateAvailable = false;
     std::wstring detail;
 };
 InstallStatus GetInstallStatus(const std::wstring &directory, const std::wstring &packageDirectory);
