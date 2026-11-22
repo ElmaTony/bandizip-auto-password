@@ -22,11 +22,11 @@
 2. 关闭 Bandizip，运行 `BandizipAutoPassword.exe`，确认安装目录，点击“安装接入”。按 Windows 提示完成管理员授权。
 3. 关闭管理器，照常解压。密码继续在 Bandizip 自己的密码管理器中维护。
 
-更新扩展：关闭 Bandizip，运行新版管理器，核对已安装版本与安装包版本，点击“更新接入”；同版本重新安装显示“修复接入”。卸载选择“卸载插件”，会恢复原版解压引擎。Bandizip 升级后可能需要重新适配。
+关闭 Bandizip 后，运行新版管理器并点击“更新接入”。同版本可点击“修复接入”，旧安装包会提示已安装更新版本。选择“卸载插件”可恢复原版解压引擎。若卸载时安装记录被占用，解除占用后可再次点击“卸载插件”完成清理。
 
 完整预校验会额外读取并解压一次选中的加密内容，用于在写出文件前完整检查，开启后耗时增加。升级不会沿用旧版默认开启的预校验。
 
-回收仅适用于完整解压到文件夹且全部文件成功的任务；选取部分文件、预览、跳过、取消或出错时保留源包。支持已验证的 7z `.001`、ZIP `.z01`、RAR3/RAR5 `.partN.rar` 分卷；按归档信息确认范围，不通配删除同名文件。源文件仍被占用时等到关闭归档再回收。网络盘、可移动盘或无法确认的格式保留源文件；回收失败会记入记录。
+回收要求整包成功解压到文件夹。漏选空目录、跳过文件、取消或出错都会保留源包。支持按归档信息核实的 7z `.001`、ZIP `.z01` 和 RAR3/RAR5 `.partN.rar` 分卷。7z 分卷缺号、源文件已被替换或无法确认完整范围时保留原文件。回收仅用于本地固定磁盘，回收失败会写入解压记录。
 
 ## 数据
 
@@ -44,6 +44,6 @@ python -m unittest discover -s tests -p "test_*.py"
 python tests/integration.py --package release --zig tools/.toolchain/zig-windows-x86_64-0.13.0/zig.exe
 ```
 
-`build.ps1 -Tests` 包含单元和核心流程回归，无需加载原引擎。完整集成测试使用隔离的应用副本、注册表和虚拟密码。发布前运行 `python tools/privacy_check.py`。验证范围与实现约束见 [审计说明](docs/AUDIT.md)。
+`build.ps1 -Tests` 包含单元和核心流程回归。完整集成测试使用隔离的应用副本、注册表和测试密码。提交源码后，运行 `python tools/package.py --output ../bzap-packages` 生成源码包、Windows 包和 SHA-256 校验文件。验证范围见 [审计说明](docs/AUDIT.md)。
 
 项目代码采用 MIT 许可证；Mbed TLS Blowfish 采用 Apache-2.0，见 `THIRD_PARTY_NOTICES.txt`。

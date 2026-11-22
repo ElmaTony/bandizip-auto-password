@@ -1,5 +1,6 @@
 #include "recycle.hpp"
 #include <algorithm>
+#include <map>
 #include <shlobj.h>
 #include <thread>
 
@@ -15,7 +16,7 @@ uint64_t SourceSize(const SourceFile &file) {
     return ((uint64_t)file.identity.nFileSizeHigh << 32) | file.identity.nFileSizeLow;
 }
 bool ReadSpan(const SourceFile &file, uint64_t offset, void *bytes, DWORD length) {
-    if (!SameSource(file) || offset > INT64_MAX)
+    if (offset > INT64_MAX)
         return false;
     HANDLE handle =
         CreateFileW(file.path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
@@ -25,7 +26,9 @@ bool ReadSpan(const SourceFile &file, uint64_t offset, void *bytes, DWORD length
     LARGE_INTEGER position;
     position.QuadPart = (LONGLONG)offset;
     DWORD read = 0;
-    bool ok = SetFilePointerEx(handle, position, nullptr, FILE_BEGIN) &&
+    BY_HANDLE_FILE_INFORMATION actual{};
+    bool ok = GetFileInformationByHandle(handle, &actual) &&
+              SameSourceIdentity(file.identity, actual) && SetFilePointerEx(handle, position, nullptr, FILE_BEGIN) &&
               ReadFile(handle, bytes, length, &read, nullptr) && read == length;
     CloseHandle(handle);
     return ok;
@@ -57,7 +60,19 @@ bool TrimSplitSources(int style, const std::wstring &root, std::vector<SourceFil
         if (offset > UINT64_MAX - 32 || size > UINT64_MAX - 32 - offset)
             return false;
         uint64_t end = 32 + offset + size, consumed = 0;
+        auto dot = root.find_last_of(L'.');
+        if (dot == std::wstring::npos)
+            return false;
+        auto width = root.size() - dot - 1;
+        if (!width || width > 10)
+            return false;
+        auto prefix = root.substr(0, dot + 1);
         for (size_t i = 0; i < files.size(); ++i) {
+            auto number = std::to_wstring(i + 1);
+            if (number.size() < width)
+                number.insert(0, width - number.size(), L'0');
+            if (_wcsicmp(files[i].path.c_str(), (prefix + number).c_str()) != 0)
+                return false;
             uint64_t part = SourceSize(files[i]);
             if (!part || part > UINT64_MAX - consumed)
                 return false;
@@ -93,18 +108,21 @@ bool TrimSplitSources(int style, const std::wstring &root, std::vector<SourceFil
     auto extension = root.find_last_of(L'.');
     if (extension == std::wstring::npos)
         return false;
+    std::map<std::wstring, const SourceFile *, SourcePathLess> byName;
+    for (const auto &file : files)
+        if (!byName.emplace(file.path, &file).second)
+            return false;
     std::vector<SourceFile> confirmed;
+    confirmed.reserve(disks);
     for (unsigned index = 1; index < disks; ++index) {
         auto number = std::to_wstring(index);
         if (number.size() < 2)
             number = L"0" + number;
         auto name = root.substr(0, extension) + L".z" + number;
-        auto found = std::find_if(files.begin(), files.end(), [&](const SourceFile &file) {
-            return _wcsicmp(name.c_str(), file.path.c_str()) == 0;
-        });
-        if (found == files.end())
+        auto found = byName.find(name);
+        if (found == byName.end())
             return false;
-        confirmed.push_back(*found);
+        confirmed.push_back(*found->second);
     }
     confirmed.push_back(*main);
     files = std::move(confirmed);
@@ -136,10 +154,12 @@ bool CaptureSource(const std::wstring &path, SourceFile &file) {
 }
 bool SameSource(const SourceFile &file) {
     SourceFile current;
-    if (!CaptureSource(file.path, current))
+    return CaptureSource(file.path, current) && SameSourceIdentity(file.identity, current.identity);
+}
+bool SameSourceIdentity(const BY_HANDLE_FILE_INFORMATION &a, const BY_HANDLE_FILE_INFORMATION &b) {
+    if (!(b.nFileIndexHigh || b.nFileIndexLow) ||
+        (b.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)))
         return false;
-    const auto &a = file.identity;
-    const auto &b = current.identity;
     return a.dwVolumeSerialNumber == b.dwVolumeSerialNumber && a.nFileIndexHigh == b.nFileIndexHigh &&
            a.nFileIndexLow == b.nFileIndexLow && a.nFileSizeHigh == b.nFileSizeHigh &&
            a.nFileSizeLow == b.nFileSizeLow && CompareFileTime(&a.ftLastWriteTime, &b.ftLastWriteTime) == 0;
@@ -161,9 +181,12 @@ bool SourcesInUse(const std::vector<SourceFile> &files) {
 namespace {
 struct Sink : IFileOperationProgressSink {
     LONG refs = 1;
-    const std::vector<SourceFile> &files;
+    std::map<std::wstring, const SourceFile *, SourcePathLess> byName;
     RecycleResult &result;
-    Sink(const std::vector<SourceFile> &f, RecycleResult &r) : files(f), result(r) {}
+    Sink(const std::vector<SourceFile> &files, RecycleResult &r) : result(r) {
+        for (const auto &file : files)
+            byName.emplace(file.path, &file);
+    }
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void **out) override {
         if (!out)
             return E_POINTER;
@@ -199,14 +222,9 @@ struct Sink : IFileOperationProgressSink {
         PWSTR path = nullptr;
         if (FAILED(item->GetDisplayName(SIGDN_FILESYSPATH, &path)))
             return E_ABORT;
-        const SourceFile *found = nullptr;
-        for (const auto &file : files)
-            if (_wcsicmp(file.path.c_str(), path) == 0) {
-                found = &file;
-                break;
-            }
+        auto found = byName.find(path);
         CoTaskMemFree(path);
-        return found && SameSource(*found) ? S_OK : E_ABORT;
+        return found != byName.end() && SameSource(*found->second) ? S_OK : E_ABORT;
     }
     HRESULT STDMETHODCALLTYPE PostDeleteItem(DWORD, IShellItem *source, HRESULT error,
                                              IShellItem *recycled) override {

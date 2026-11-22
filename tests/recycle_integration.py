@@ -55,6 +55,14 @@ def run_recycle_tests(app, source, fixtures, work, data, zig, run, check, histor
         extract('recycle-selected-kept', archive, [archive], False, extras=['proof.txt'])
         check('selected-engine-path', (cases / 'recycle-selected-kept-out/proof.txt').exists() and
               not (cases / 'recycle-selected-kept-out/other.txt').exists())
+        archive = cases / 'partial-directory.zip'
+        with zipfile.ZipFile(archive, 'w') as package:
+            package.writestr('proof.txt', b'selected file')
+            package.writestr('empty/', b'')
+        extract('recycle-unselected-directory-kept', archive, [archive], False, extras=['proof.txt'])
+        selected_output = cases / 'recycle-unselected-directory-kept-out'
+        check('unselected-empty-directory-omitted', (selected_output / 'proof.txt').read_bytes() == b'selected file'
+              and not (selected_output / 'empty').exists())
         archive = cases / 'skip.zip'
         shutil.copy2(fixtures / 'plain.zip', archive)
         target = cases / 'recycle-skipped-kept-out'

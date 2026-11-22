@@ -20,6 +20,14 @@ def run_installer_tests(app, manage, check, sha, original):
     check('older-version-update-offered', status['installed'] and
           status['installed_version'] == '0.9.0' and status['update_available'])
 
+    manifest.write_text(text.replace('Version=0.9.0', 'Version=10.0.0'), encoding='utf8')
+    _, status = manage('--status')
+    before = sha(engine)
+    check('newer-install-not-an-update', status['installed'] and not status['update_available'])
+    response, result = manage('--install')
+    check('older-package-cannot-downgrade', response.returncode != 0 and not result['ok'] and sha(engine) == before)
+    manifest.write_text(text, encoding='utf8')
+
     folder = app / 'AutoPassword'
     obsolete = [folder / name for name in
                 ['retired-100.dll', 'retired-proxy-200.dll', 'uncommitted-300.dll']]
@@ -46,6 +54,22 @@ def run_installer_tests(app, manage, check, sha, original):
     check('retired-component-cleaned-after-release', result['ok'] and not locked.exists())
     _, status = manage('--status')
     check('updated-version-status', status['installed_version'] == version and not status['update_available'])
+
+    # An interrupted update can leave the previous hash next to an already
+    # installed current DLL. The manager must recognize its verified binary.
+    text = re.sub(r'^ProxySHA256=.*$', 'ProxySHA256=' + '0' * 64,
+                  manifest.read_text('utf8'), flags=re.M)
+    manifest.write_text(text, encoding='utf8')
+    with manifest.open('rb'):
+        response, result = manage('--uninstall')
+        check('locked-manifest-reports-uninstall-incomplete', response.returncode != 0 and not result['ok'])
+        check('stale-manifest-restores-original-engine', sha(engine) == original and manifest.exists())
+    _, status = manage('--status')
+    check('unfinished-uninstall-can-be-retried', not status['installed'] and status['can_uninstall'])
+    _, result = manage('--uninstall')
+    check('unfinished-uninstall-retried', result['ok'] and not manifest.exists() and sha(engine) == original)
+    _, result = manage('--install')
+    check('install-after-uninstall-retry', result['ok'] and engine.read_bytes() == current)
 
 
 def check_uninstalled(app, manage, check):

@@ -4,9 +4,10 @@ import argparse
 import hashlib
 import re
 import subprocess
+import tempfile
 import zipfile
 
-from privacy_check import check_bytes
+from privacy_check import RUNTIME, RUNTIME_DOCS, check_artifacts, check_bytes, forbidden
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = re.search(r'ProductVersion\[\]\s*=\s*L"([0-9.]+)"',
@@ -25,39 +26,53 @@ def add(archive, path, name, data=None):
     archive.writestr(info, data)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--output', required=True)
-    args = parser.parse_args()
-    output = Path(args.output).resolve()
-    if output == ROOT or ROOT in output.parents:
-        raise ValueError('Place release archives outside the source project.')
-    output.mkdir(parents=True, exist_ok=True)
-    runtime = ['BandizipAutoPassword.exe', 'ark.x64.dll', 'README.md',
-               'THIRD_PARTY_NOTICES.txt', 'MbedTLS-LICENSE.txt', 'LICENSE']
+def write_archives(output, commit):
     binary = output / f'BandizipAutoPassword-{VERSION}-windows-x64.zip'
     source = output / f'BandizipAutoPassword-{VERSION}-source.zip'
     with zipfile.ZipFile(binary, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-        for name in runtime:
+        for name in sorted(RUNTIME | RUNTIME_DOCS):
             add(archive, ROOT / 'release' / name, name)
-        for name in ['docs/AUDIT.md', 'assets/manager.png']:
-            add(archive, ROOT / name, name)
-    tracked = subprocess.check_output(['git', 'ls-files', '-z'], cwd=ROOT).decode('utf8').split('\0')
-    if not any(name == 'src/proxy.cpp' for name in tracked):
-        raise ValueError('Stage the complete source tree before packaging.')
-    subprocess.run(['git', 'diff', '--exit-code', '--quiet'], cwd=ROOT, check=True)
+    tracked = subprocess.check_output(['git', 'ls-tree', '-rz', commit], cwd=ROOT).decode('utf8').split('\0')
     with zipfile.ZipFile(source, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
-        for name in sorted(filter(None, tracked)):
+        for entry in filter(None, tracked):
+            metadata, name = entry.split('\t', 1)
+            mode, kind, blob = metadata.split()
             path = ROOT / name
-            if path.is_symlink() or any(p in {'build', 'dist', 'release', '.toolchain', '.git'} for p in path.relative_to(ROOT).parts):
+            if kind != 'blob' or mode not in {'100644', '100755'} or any(
+                    p in {'build', 'dist', 'release', '.toolchain', '.git'} for p in Path(name).parts):
                 raise ValueError('Unexpected tracked artifact: ' + name)
-            if path.suffix.lower() in {'.exe', '.dll', '.pdb', '.log', '.zip', '.jsonl', '.dmp', '.o', '.obj', '.lib'}:
+            if forbidden(name) or path.suffix.lower() in {'.exe', '.dll', '.zip', '.o', '.obj', '.lib'}:
                 raise ValueError('Unexpected tracked binary/log: ' + name)
-            data = subprocess.check_output(['git', 'show', ':' + name], cwd=ROOT)
+            data = subprocess.check_output(['git', 'cat-file', 'blob', blob], cwd=ROOT)
             add(archive, path, 'BandizipAutoPassword-source/' + name, data)
     checksums = ''.join(hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name + '\n'
                         for path in [binary, source])
     (output / 'SHA256SUMS.txt').write_text(checksums, encoding='utf8', newline='\n')
+    return checksums
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--output', type=Path, required=True)
+    output = parser.parse_args().output.resolve()
+    if output == ROOT or ROOT in output.parents or output in ROOT.parents:
+        raise ValueError('Choose a separate release directory outside the project.')
+    if output.exists() and (not output.is_dir() or any(output.iterdir())):
+        raise ValueError('The release destination must be new or empty.')
+    if subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT):
+        raise ValueError('Commit the intended source before packaging.')
+    commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=output.parent, prefix='.bzap-package-') as temporary:
+        staging = Path(temporary) / 'release'
+        staging.mkdir()
+        checksums = write_archives(staging, commit)
+        errors, _ = check_artifacts(staging)
+        if errors:
+            raise ValueError('Release validation failed: ' + ', '.join(errors))
+        if output.exists():
+            output.rmdir()  # Accept only an empty destination, including at commit time.
+        staging.rename(output)
     print(checksums, end='')
 
 

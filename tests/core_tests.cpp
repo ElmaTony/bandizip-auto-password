@@ -9,7 +9,9 @@ namespace bzap { PasswordStore ReadTestStore(); }
 #include <cstdio>
 
 namespace bzap {
+int dummyStoreReads = 0;
 PasswordStore ReadTestStore() {
+    ++dummyStoreReads;
     PasswordStore store;
     store.status = StoreStatus::Ready;
     store.passwords = {L"dummy-first", L"dummy-second"};
@@ -27,6 +29,19 @@ void Check(bool ok, const char *name) {
 }
 int WINAPI Count(void *) { return itemCount; }
 int WINAPI SelectedCount(void *) { return selectedCount; }
+std::vector<int> nativeSelection;
+int rejectedIndex = -1;
+int WINAPI AddIndex(void *, int index) {
+    if (index == rejectedIndex)
+        return FALSE;
+    nativeSelection.push_back(index);
+    selectedCount = (int)nativeSelection.size();
+    return TRUE;
+}
+void WINAPI ClearIndices(void *) { nativeSelection.clear(); selectedCount = 0; }
+int WINAPI ExtractSelected(void *, const wchar_t *, const wchar_t *) {
+    return nativeSelection == std::vector<int>{1};
+}
 int WINAPI Encrypted(void *) { return TRUE; }
 ark::Error WINAPI Error(void *) { return ark::CrcError; }
 const ark::FileItem *WINAPI Item(void *, int index) { return (const ark::FileItem *)items[index]; }
@@ -76,6 +91,9 @@ int wmain() {
     table[14] = (void *)&Item; table[17] = (void *)&Encrypted;
     table[25] = (void *)&VerifyOne; table[36] = (void *)&Error;
     table[31] = (void *)&SelectedCount;
+    table[29] = (void *)&AddIndex;
+    table[30] = (void *)&ClearIndices;
+    table[33] = (void *)&ExtractSelected;
     auto object = table;
     auto c = std::make_shared<Context>(); c->object = &object; c->original = table;
     c->path = L"synthetic-core.zip"; contexts[&object] = c;
@@ -89,24 +107,54 @@ int wmain() {
         int stop = 0; events.OnError(ark::CrcError, Item(nullptr, index), 0, stop);
         events.CompleteFile(nullptr, ark::CrcError);
     };
+    auto execute = [&](const std::function<int()> &extract, const std::function<int(ark::Output *)> &verify,
+                       bool disk = false, bool selected = false,
+                       const std::function<int(const std::vector<int> &)> &resume = {}) {
+        return Execute(&object, extract, verify, disk, selected, resume, directory.c_str());
+    };
     auto verified = [](ark::Output *) { return TRUE; };
     int extracted = 0, resumed = 0;
     configure(true);
-    int result = Execute(&object, [&] { ++extracted; return TRUE; }, [&](ark::Output *) {
+    int result = execute([&] { ++extracted; return TRUE; }, [&](ark::Output *) {
         c->canceled = true; return TRUE;
     });
     Check(!result && extracted == 0 && ErrorHook(&object) == ark::Canceled, "preflight cancel prevents extraction");
     Check(!c->canResume, "preflight early exit resets retry state");
+    int validations = 0;
+    result = execute([&] { ++extracted; return TRUE; }, [&](ark::Output *) {
+        if (++validations == 1) {
+            ++c->attempts;
+            fail(0);
+        }
+        return TRUE;
+    });
+    Check(result && validations == 2 && extracted == 1,
+          "a positive backend return cannot hide a failed preflight item");
+    validations = extracted = 0;
+    result = execute([&] { ++extracted; return TRUE; }, [&](ark::Output *) {
+        ++validations;
+        // Other files may progress while the failing item's candidate stays the same.
+        ++c->attempts;
+        if (validations < 4) fail(0);
+        return TRUE;
+    });
+    Check(!result && validations == 2 && extracted == 0, "stalled verification stops without disk extraction");
     configure(false);
-    result = Execute(&object, [&] {
+    result = execute([&] { c->exhausted = true; c->lastError = ark::PasswordWrong; return TRUE; }, verified);
+    Check(!result && ErrorHook(&object) != 0, "exhaustion overrides a positive extraction return");
+    result = execute([&] {
         start(0); Check(WriteOutput(output, "partial"), "write owned partial output");
         fail(0); AtomicWrite(output, "unrelated replacement"); return FALSE;
     }, verified, true, false, [&](const std::vector<int> &) { ++resumed; return TRUE; });
     Check(!result && resumed == 0 && c->canceled, "replacement before failure snapshot rejects retry");
     Check(OutputEquals(output, "unrelated replacement"), "unrelated replacement preserved");
+    std::vector<unsigned char> history;
+    Check(ReadFileBytes(Join(directory, L"history.jsonl"), history) &&
+          std::string(history.begin(), history.end()).find("\"output_changed\"") != std::string::npos,
+          "history distinguishes output conflict from user cancellation");
     DeleteFileW(output.c_str());
     duringVerify = [&] { AtomicWrite(output, "replacement during verification"); };
-    result = Execute(&object, [&] { start(0); WriteOutput(output, "partial"); fail(0); return FALSE; },
+    result = execute([&] { start(0); WriteOutput(output, "partial"); fail(0); return FALSE; },
                      verified, true, false, [&](const std::vector<int> &) {
         Check(start(0) != 0, "replacement during verification cancels native write"); return TRUE;
     });
@@ -115,12 +163,12 @@ int wmain() {
     duringVerify = {}; DeleteFileW(output.c_str());
     duringVerify = [&] { c->canceled = true; };
     resumed = 0;
-    result = Execute(&object, [&] { start(0); WriteOutput(output, "partial"); fail(0); return FALSE; },
+    result = execute([&] { start(0); WriteOutput(output, "partial"); fail(0); return FALSE; },
                      verified, true, false, [&](const std::vector<int> &) { ++resumed; return TRUE; });
     Check(!result && !resumed && ErrorHook(&object) == ark::Canceled,
           "canceled retry verification never resumes extraction");
     duringVerify = {}; DeleteFileW(output.c_str());
-    result = Execute(&object, [&] {
+    result = execute([&] {
         start(0, 1); events.CompleteFile(nullptr, ark::UserSkip);
         start(1); WriteOutput(output, "partial"); fail(1); DeleteFileW(output.c_str()); return FALSE;
     }, verified, true, false, [&](const std::vector<int> &indices) {
@@ -133,7 +181,7 @@ int wmain() {
     Check(result && !c->canResume && c->outputOwners.empty(), "retry succeeds and releases state");
     DeleteFileW(output.c_str());
     c->selection = {1}; selectedCount = 1;
-    result = Execute(&object, [&] { start(1); WriteOutput(output, "partial"); fail(1); return FALSE; },
+    result = execute([&] { start(1); WriteOutput(output, "partial"); fail(1); return FALSE; },
                      verified, true, true, [&](const std::vector<int> &indices) {
         Check(indices == std::vector<int>{1}, "selected retry excludes unselected items");
         Check(!start(1), "selected retry retains owned output");
@@ -141,6 +189,15 @@ int wmain() {
     });
     Check(result && OutputEquals(output, "selected output"), "selected retry succeeds");
     c->selection.clear(); selectedCount = 0;
+    AddIndex(nullptr, 0); c->selection = {0};
+    Check(ResumeTo(c, nullptr, nullptr, {1}, true) && nativeSelection == std::vector<int>{0} &&
+          c->selection == nativeSelection, "whole archive retry preserves pending native selection");
+    rejectedIndex = 2;
+    Check(!ResumeTo(c, nullptr, nullptr, {1, 2}, true) && nativeSelection == std::vector<int>{0} &&
+          c->selection == nativeSelection, "failed selection setup restores pending items");
+    rejectedIndex = -1;
+    Check(ResumeTo(c, nullptr, nullptr, {1}, false) && nativeSelection.empty() && c->selection.empty(),
+          "selected archive retry consumes its internal selection");
     OutputSnapshot regular, extended;
     Check(CaptureOutput(output, regular) && CaptureOutput(OutputPath(output), extended) &&
               SameOutputIdentity(regular, extended), "extended output paths preserve identity");
@@ -178,6 +235,14 @@ int wmain() {
         Check(ScrollPosition(100000, desired.bottom, 500) == desired.bottom - 500,
               "scroll reaches bottom at each DPI");
     }
+    auto root = OutputPath(directory);
+    Check(WithinOutputRoot(root, Join(directory, L"folder\\proof.txt")), "nested output belongs to selection");
+    Check(!WithinOutputRoot(root, Join(directory + L"-different", L"proof.txt")), "sibling prefix not owned");
+    Check(!WithinOutputRoot(root, L"proof.txt"), "unspecified destination is not owned");
+    int reads = dummyStoreReads;
+    c->Reset(nullptr, true);
+    Check(c->passThrough && dummyStoreReads == reads && c->store.passwords.empty(),
+          "native-only stream does not read the password store");
     contexts.clear();
     for (auto name : {L"proof.txt", L"settings.ini", L"history.jsonl", L"解压记录.txt"})
         DeleteFileW(Join(directory, name).c_str());

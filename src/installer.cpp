@@ -1,6 +1,7 @@
 #include "installer.hpp"
 #include "package_identity.hpp"
-#include <memory>
+#include <array>
+#include <optional>
 #include <tlhelp32.h>
 
 namespace bzap {
@@ -39,6 +40,34 @@ std::wstring Ini(const std::wstring &path, const wchar_t *key) {
     GetPrivateProfileStringW(L"Installation", key, L"", buffer, 1024, path.c_str());
     return buffer;
 }
+// Historical manifests use three components. Also accept the four-component
+// spelling used in Windows version resources, comparing numbers rather than text.
+std::optional<std::array<unsigned, 4>> VersionParts(const std::wstring &version) {
+    std::array<unsigned, 4> parts{};
+    size_t pos = 0;
+    for (size_t i = 0; i < parts.size(); ++i) {
+        size_t start = pos;
+        while (pos < version.size() && version[pos] >= L'0' && version[pos] <= L'9') {
+            parts[i] = parts[i] * 10 + (version[pos++] - L'0');
+            if (parts[i] > 65535)
+                return std::nullopt;
+        }
+        if (pos == start)
+            return std::nullopt;
+        if (pos == version.size() && i >= 2)
+            return parts;
+        if (pos == version.size() || version[pos++] != L'.')
+            return std::nullopt;
+    }
+    return std::nullopt;
+}
+std::string ManifestHash(const std::wstring &manifest) {
+    if (Ini(manifest, L"Product") != L"BandizipAutoPassword")
+        return {};
+    auto hash = Utf8(Ini(manifest, L"ProxySHA256"));
+    return hash.size() == 64 && hash.find_first_not_of("0123456789abcdef") == std::string::npos
+               ? hash : std::string{};
+}
 bool InUse(const std::wstring &dir) {
     auto target = Full(Join(dir, L"Bandizip.exe"));
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -67,6 +96,27 @@ InstallResult Failure(const std::wstring &message, DWORD code = 0) {
         code = GetLastError();
     return {false, code, message + L"\n" + SystemError(code)};
 }
+struct ComponentDirectory {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+    bool Open(const std::wstring &path) {
+        handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+            return false;
+        BY_HANDLE_FILE_INFORMATION info{};
+        if (!GetFileInformationByHandle(handle, &info))
+            return false;
+        if ((info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != FILE_ATTRIBUTE_DIRECTORY) {
+            SetLastError(ERROR_DIRECTORY);
+            return false;
+        }
+        return true;
+    }
+    ~ComponentDirectory() {
+        if (handle != INVALID_HANDLE_VALUE)
+            CloseHandle(handle);
+    }
+};
 bool SaveManifest(const std::wstring &dir, const std::string &proxy) {
     auto body = "[Installation]\r\nProduct=BandizipAutoPassword\r\nVersion=" + Utf8(ProductVersion) +
                 "\r\nEngineVersion=7.47.0.1\r\nOriginalSHA256=" +
@@ -82,6 +132,8 @@ void CleanRetired(const std::wstring &directory) {
     do {
         if (data.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) continue;
         std::wstring name = data.cFileName;
+        if (name.size() < 5 || _wcsicmp(name.c_str() + name.size() - 4, L".dll"))
+            continue;
         bool owned = false;
         for (auto prefix : {L"retired-", L"retired-proxy-", L"uncommitted-"}) {
             size_t start = wcslen(prefix), end = name.size() - 4;
@@ -107,33 +159,47 @@ void CleanRetired(const std::wstring &directory) {
     FindClose(search);
 }
 } // namespace
-InstallStatus GetInstallStatus(const std::wstring &directory, const std::wstring &packageDirectory) {
+InstallStatus GetInstallStatus(const std::wstring &directory) {
     InstallStatus out;
     out.directory = Full(directory);
     auto app = Join(out.directory, L"Bandizip.exe");
     auto engine = Join(out.directory, L"ark.x64.dll");
     out.version = FileVersion(app);
-    out.backupValid = FileHash(Join(out.directory, OriginalDllName)) == SupportedArkSha256;
+    auto backup = Join(out.directory, OriginalDllName);
+    out.backupValid = FileHash(backup) == SupportedArkSha256;
     auto currentHash = FileHash(engine);
-    auto manifestHash = Utf8(Ini(Manifest(out.directory), L"ProxySHA256"));
-    out.installed = out.backupValid &&
-                    ((!manifestHash.empty() && currentHash == manifestHash) || currentHash == PackageSha256);
+    auto manifestHash = ManifestHash(Manifest(out.directory));
+    out.installed = (!manifestHash.empty() && currentHash == manifestHash && currentHash != SupportedArkSha256) ||
+                    currentHash == PackageSha256;
+    out.canUninstall = !manifestHash.empty() || out.installed;
     bool recovery = out.backupValid && !Exists(engine);
     out.supported = out.version == L"7.47.0.1" && IsAmd64Image(app) &&
-                    (out.installed || currentHash == SupportedArkSha256 || recovery);
+                    ((out.installed && out.backupValid) ||
+                     (currentHash == SupportedArkSha256 && (!Exists(backup) || out.backupValid)) || recovery);
     if (out.installed) {
         out.installedVersion = currentHash == PackageSha256 ? ProductVersion : Ini(Manifest(out.directory), L"Version");
-        if (out.installedVersion.empty()) out.installedVersion = L"未知版本";
-        out.updateAvailable = out.supported && currentHash != PackageSha256;
+        auto installed = VersionParts(out.installedVersion), package = VersionParts(ProductVersion);
+        if (installed && package) {
+            out.updateAvailable = out.supported && *installed < *package;
+            out.newerInstalled = *installed > *package;
+        }
+        if (out.installedVersion.empty())
+            out.installedVersion = L"未知版本";
     }
-    if (out.installed && !out.supported)
+    if (!out.backupValid && (out.installed || Exists(backup)))
+        out.detail = L"原引擎备份缺失或校验失败，请先恢复与此 Bandizip 构建匹配的原版引擎。";
+    else if (out.installed && !out.supported)
         out.detail = L"Bandizip 版本已变化，自动匹配已停用，请卸载插件";
     else if (out.updateAvailable)
         out.detail = L"已安装 " + out.installedVersion + L"，可更新到 " + ProductVersion;
+    else if (out.newerInstalled)
+        out.detail = L"已安装 " + out.installedVersion + L"，高于安装包 " + ProductVersion + L"。";
     else if (out.installed)
         out.detail = L"自动密码扩展已安装";
     else if (recovery && out.supported)
         out.detail = L"解压引擎缺失，可从已校验的备份修复";
+    else if (out.canUninstall)
+        out.detail = L"当前引擎已变化，可点击“卸载插件”清理上次的接入记录。";
     else if (out.supported)
         out.detail = L"当前版本可安装，尚未接入";
     else if (Exists(Manifest(out.directory)))
@@ -151,8 +217,8 @@ InstallResult Install(const std::wstring &directory, const std::wstring &package
         return Failure(L"这个文件夹内没有 Bandizip.exe", ERROR_PATH_NOT_FOUND);
     if (InUse(dir))
         return Failure(L"请先关闭 Bandizip 的所有窗口，再重新安装。", ERROR_BUSY);
-    auto status = GetInstallStatus(dir, packageDirectory);
-    if (!status.supported)
+    auto status = GetInstallStatus(dir);
+    if (!status.supported || status.newerInstalled)
         return Failure(status.detail, ERROR_REVISION_MISMATCH);
     auto source = Join(packageDirectory, L"ark.x64.dll");
     auto proxyHash = FileHash(source);
@@ -163,16 +229,25 @@ InstallResult Install(const std::wstring &directory, const std::wstring &package
     auto component = Join(dir, L"AutoPassword");
     if (!EnsureDirectory(component))
         return Failure(L"无法写入 Bandizip 文件夹，安装需要管理员权限");
+    ComponentDirectory componentLock;
+    if (!componentLock.Open(component))
+        return Failure(L"无法确认扩展组件目录");
     if (!Exists(backup)) {
         if (!CopyFileW(engine.c_str(), backup.c_str(), TRUE))
             return Failure(L"备份原解压引擎失败，尚未替换任何组件");
     }
     if (FileHash(backup) != SupportedArkSha256)
         return Failure(L"原引擎备份校验失败，已停止安装", ERROR_CRC);
+    if (FileHash(engine) == PackageSha256) {
+        if (!SaveManifest(dir, proxyHash))
+            return Failure(L"已安装的扩展校验通过，但无法更新安装记录");
+        CleanRetired(dir);
+        return {true, 0, L"当前扩展及原引擎备份校验通过，安装记录已更新。"};
+    }
     if (!Exists(engine) && !CopyFileW(backup.c_str(), engine.c_str(), TRUE))
         return Failure(L"无法从已校验的备份恢复缺失的引擎");
     auto stage = Join(dir, L"ark.bzap-stage-" + std::to_wstring(GetCurrentProcessId()) + L".dll");
-    if (!CopyFileW(source.c_str(), stage.c_str(), FALSE))
+    if (!CopyFileW(source.c_str(), stage.c_str(), TRUE))
         return Failure(L"复制扩展失败，原组件保留");
     if (FileHash(stage) != proxyHash) {
         DeleteFileW(stage.c_str());
@@ -191,10 +266,11 @@ InstallResult Install(const std::wstring &directory, const std::wstring &package
         return Failure(L"接入失败，已尝试恢复原组件", error);
     }
     if (!SaveManifest(dir, proxyHash)) {
+        DWORD error = GetLastError();
         auto failed = Join(component, L"uncommitted-" + std::to_wstring(GetTickCount64()) + L".dll");
         MoveFileExW(engine.c_str(), failed.c_str(), MOVEFILE_WRITE_THROUGH);
         MoveFileExW(retired.c_str(), engine.c_str(), MOVEFILE_WRITE_THROUGH);
-        return Failure(L"安装记录未能保存，已尝试恢复原组件");
+        return Failure(L"安装记录未能保存，已尝试恢复原组件", error);
     }
     CleanRetired(dir);
     return {true, 0, L"已安装。以后照常双击或使用原来的右键菜单解压即可。\n无需启动管理器或后台助手。"};
@@ -209,38 +285,42 @@ InstallResult Uninstall(const std::wstring &directory) {
     if (InUse(dir))
         return Failure(L"请先关闭 Bandizip 的所有窗口，再卸载插件。", ERROR_BUSY);
     auto manifest = Manifest(dir);
-    auto proxyHash = Utf8(Ini(manifest, L"ProxySHA256"));
     auto engine = Join(dir, L"ark.x64.dll");
     auto backup = Join(dir, OriginalDllName);
-    if (proxyHash.empty() && FileHash(engine) == PackageSha256)
-        proxyHash = PackageSha256;
+    auto current = FileHash(engine);
+    auto proxyHash = current == PackageSha256 ? std::string(PackageSha256) : ManifestHash(manifest);
     if (proxyHash.empty())
         return Failure(L"没有找到此扩展的安装记录，未改动任何组件", ERROR_FILE_NOT_FOUND);
-    auto current = FileHash(engine);
+    auto component = Directory(manifest);
+    ComponentDirectory componentLock;
+    if (!EnsureDirectory(component) || !componentLock.Open(component))
+        return Failure(L"无法确认扩展组件目录");
+    auto finish = [&](const wchar_t *message) -> InstallResult {
+        auto inactive = Join(Directory(manifest), L"installation.inactive.ini");
+        if (!MoveFileExW(manifest.c_str(), inactive.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            DWORD error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND)
+                return Failure(L"解压引擎已保留，但安装记录未能停用。请解除文件占用后再次卸载。", error);
+        }
+        CleanRetired(dir);
+        return {true, 0, message};
+    };
     if (!Exists(engine) && FileHash(backup) == SupportedArkSha256) {
         if (!CopyFileW(backup.c_str(), engine.c_str(), TRUE))
             return Failure(L"恢复缺失的引擎失败");
-        MoveFileExW(manifest.c_str(), Join(Directory(manifest), L"installation.inactive.ini").c_str(),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-        CleanRetired(dir);
-        return {true, 0, L"已从校验通过的备份恢复原版解压引擎。"};
+        return finish(L"已从校验通过的备份恢复原版解压引擎。");
     }
     if (current != proxyHash) {
         // An application update may have replaced our DLL. Never roll back a
         // newer Bandizip engine while removing this extension.
         if (current.empty())
             return Failure(L"当前引擎无法读取，未自动覆盖组件", ERROR_READ_FAULT);
-        auto inactive = Join(Directory(manifest), L"installation.inactive.ini");
-        if (!MoveFileExW(manifest.c_str(), inactive.c_str(),
-                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-            return Failure(L"无法停用安装记录");
-        CleanRetired(dir);
-        return {true, 0, L"当前引擎已不是此扩展，已保留现有组件并停用扩展记录。"};
+        return finish(L"已保留当前解压引擎并停用扩展记录。");
     }
     if (FileHash(backup) != SupportedArkSha256)
         return Failure(L"原引擎备份缺失或校验失败，未覆盖当前组件", ERROR_CRC);
     auto stage = Join(dir, L"ark.bzap-restore-" + std::to_wstring(GetCurrentProcessId()) + L".dll");
-    if (!CopyFileW(backup.c_str(), stage.c_str(), FALSE))
+    if (!CopyFileW(backup.c_str(), stage.c_str(), TRUE))
         return Failure(L"准备恢复副本失败");
     if (FileHash(stage) != SupportedArkSha256) {
         DeleteFileW(stage.c_str());
@@ -258,10 +338,6 @@ InstallResult Uninstall(const std::wstring &directory) {
         DeleteFileW(stage.c_str());
         return Failure(L"恢复失败，已尝试回滚", error);
     }
-    MoveFileExW(manifest.c_str(), Join(Directory(manifest), L"installation.inactive.ini").c_str(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
-    CleanRetired(dir);
-    return {true, 0,
-            L"已卸载插件并恢复原版解压引擎。原密码管理器和文件关联均保留。\n备份及解压记录继续保留，方便核对。"};
+    return finish(L"已卸载插件并恢复原版解压引擎。");
 }
 } // namespace bzap

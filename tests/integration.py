@@ -126,7 +126,13 @@ def main():
         if not ok:raise AssertionError(name)
     def run(command,timeout=25,**kwargs):return subprocess.run(list(map(str,command)),env=env,capture_output=True,timeout=timeout,**kwargs)
     def manage(action):
-        result=work/'install-result.json';r=run([Path(args.package)/'BandizipAutoPassword.exe',action,'--directory',app,'--quiet','--result',result]);return r,json.loads(result.read_text('utf8'))
+        result = work / 'install-result.json'
+        result.unlink(missing_ok=True)
+        r = run([Path(args.package) / 'BandizipAutoPassword.exe', action, '--directory', app,
+                 '--quiet', '--result', result])
+        if not result.is_file():
+            raise AssertionError(f'{action} returned {r.returncode} without a result')
+        return r, json.loads(result.read_text('utf8'))
     def history():
         p=data/'history.jsonl';return [json.loads(l) for l in p.read_text('utf8').splitlines()] if p.exists() else []
     def trace():return (work/'trace.txt').read_text('utf8') if (work/'trace.txt').exists() else ''
@@ -137,7 +143,9 @@ def main():
         try:code=p.wait(timeout=25)
         except subprocess.TimeoutExpired:p.terminate();p.wait(5);check(label+'-no-hang',False)
         file=output/'proof.txt';matches=file.exists() and file.read_bytes()==CONTENT
-        records=history()[before:];check(label,(matches if success else not matches) and code<0x80000000,exit=code,records=records)
+        records=history()[before:]
+        check(label, (matches and code == 0) if success else (not matches and 0 <= code < 0x80000000),
+              exit=code, records=records)
         if not success:check(label+'-reported',any(r['outcome'].startswith('password') and r['archive'].endswith(archive) for r in records))
         if not success:check(label+'-not-success',not any(r['outcome']=='success' for r in records))
         if not success:check(label+'-archive-preserved',(fixtures/archive).exists())

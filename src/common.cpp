@@ -46,8 +46,7 @@ std::wstring DataDirectory() {
     wchar_t overridePath[32768];
     DWORD n = GetEnvironmentVariableW(L"BZAP_DATA_DIR", overridePath, 32768);
     if (n && n < 32768) {
-        EnsureDirectory(overridePath);
-        return overridePath;
+        return EnsureDirectory(overridePath) ? std::wstring(overridePath) : std::wstring{};
     }
     PWSTR local = nullptr;
     std::wstring result;
@@ -55,8 +54,7 @@ std::wstring DataDirectory() {
         result = Join(local, L"BandizipAutoPassword");
         CoTaskMemFree(local);
     }
-    EnsureDirectory(result);
-    return result;
+    return EnsureDirectory(result) ? result : std::wstring{};
 }
 std::wstring DefaultBandizipDirectory() {
     wchar_t value[32768];
@@ -133,6 +131,7 @@ std::string UtcNow() {
     return b;
 }
 bool ReadFileBytes(const std::wstring &path, std::vector<unsigned char> &bytes, std::size_t maximum) {
+    bytes.clear();
     HANDLE file =
         CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -140,7 +139,8 @@ bool ReadFileBytes(const std::wstring &path, std::vector<unsigned char> &bytes, 
         return false;
     LARGE_INTEGER size;
     bool ok =
-        GetFileSizeEx(file, &size) && size.QuadPart >= 0 && (unsigned long long)size.QuadPart <= maximum;
+        GetFileSizeEx(file, &size) && size.QuadPart >= 0 && size.QuadPart <= MAXDWORD &&
+        (unsigned long long)size.QuadPart <= maximum;
     if (ok) {
         bytes.resize((size_t)size.QuadPart);
         DWORD done = 0;
@@ -220,15 +220,23 @@ std::wstring FileVersion(const std::wstring &path) {
            std::to_wstring(LOWORD(info->dwFileVersionLS));
 }
 bool IsAmd64Image(const std::wstring &path) {
-    std::vector<unsigned char> data;
-    if (!ReadFileBytes(path, data, 64 * 1024 * 1024) || data.size() < sizeof(IMAGE_DOS_HEADER))
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
         return false;
-    auto dos = (IMAGE_DOS_HEADER *)data.data();
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0 ||
-        (size_t)dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > data.size())
-        return false;
-    auto nt = (IMAGE_NT_HEADERS64 *)(data.data() + dos->e_lfanew);
-    return nt->Signature == IMAGE_NT_SIGNATURE && nt->FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64;
+    IMAGE_DOS_HEADER dos{};
+    IMAGE_NT_HEADERS64 nt{};
+    DWORD read = 0;
+    bool valid = ReadFile(file, &dos, sizeof(dos), &read, nullptr) && read == sizeof(dos) &&
+                 dos.e_magic == IMAGE_DOS_SIGNATURE && dos.e_lfanew >= (LONG)sizeof(dos);
+    LARGE_INTEGER offset{};
+    offset.QuadPart = dos.e_lfanew;
+    valid = valid && SetFilePointerEx(file, offset, nullptr, FILE_BEGIN) &&
+            ReadFile(file, &nt, sizeof(nt), &read, nullptr) && read == sizeof(nt) &&
+            nt.Signature == IMAGE_NT_SIGNATURE && nt.FileHeader.Machine == IMAGE_FILE_MACHINE_AMD64 &&
+            nt.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC;
+    CloseHandle(file);
+    return valid;
 }
 bool AtomicWrite(const std::wstring &path, const std::string &data) {
     static std::atomic<unsigned long long> sequence{0};
@@ -263,7 +271,10 @@ bool AtomicWrite(const std::wstring &path, const std::string &data) {
 }
 Settings LoadSettings() {
     Settings s;
-    auto ini = Join(DataDirectory(), L"settings.ini");
+    auto directory = DataDirectory();
+    if (directory.empty())
+        return s;
+    auto ini = Join(directory, L"settings.ini");
     s.enabled = GetPrivateProfileIntW(L"General", L"Enabled", 1, ini.c_str()) != 0;
     s.notify = GetPrivateProfileIntW(L"General", L"NotifyFailures", 1, ini.c_str()) != 0;
     // Earlier releases enabled full preflight implicitly. Require a fresh,

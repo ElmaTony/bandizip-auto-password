@@ -42,6 +42,10 @@ void Append(const std::wstring &path, const std::string &line) {
 std::wstring Description(const Result &r) {
     if (r.outcome == L"success")
         return L"已解压";
+    if (r.outcome == L"skipped_items")
+        return L"已完成所选操作，部分项目已跳过";
+    if (r.outcome == L"output_changed")
+        return L"无法确认重试目标，已停止写入并保留压缩包";
     if (r.outcome == L"recycled")
         return L"已解压，压缩包已移入回收站（" + std::to_wstring(r.recycledVolumes) + L" 个文件）";
     if (r.outcome == L"recycle_failed")
@@ -55,6 +59,8 @@ std::wstring Description(const Result &r) {
         return L"已有密码全部尝试后仍未成功";
     if (r.outcome == L"password_or_data_error")
         return L"已有密码未能完成校验，可能是密码不匹配或压缩包损坏";
+    if (r.outcome == L"data_error")
+        return L"压缩包内容校验失败";
     return L"发生其他解压错误";
 }
 HRESULT CALLBACK NotifyCallback(HWND window, UINT notice, WPARAM elapsed, LPARAM, LONG_PTR) {
@@ -227,9 +233,16 @@ void FinishNotifications() {
     Display(list);
 }
 void ShowRecords() {
-    auto file = Join(DataDirectory(), L"解压记录.txt");
-    if (!Exists(file))
-        AtomicWrite(file, "尚无解压记录。\r\n");
+    auto directory = DataDirectory();
+    if (directory.empty()) {
+        MessageBoxW(nullptr, L"无法访问解压记录目录。", L"解压记录", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    auto file = Join(directory, L"解压记录.txt");
+    if (!Exists(file)) {
+        MessageBoxW(nullptr, L"尚无解压记录。", L"解压记录", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
     ShellExecuteW(nullptr, L"open", file.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 } // namespace bzap

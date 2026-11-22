@@ -79,19 +79,27 @@ void Refresh() {
         installStatus.version = L"7.47.0.1";
         passwordHint = L"已保存 12 个不同密码 · 本地读取";
     } else {
-        installStatus = GetInstallStatus(installDirectory, packageDirectory);
+        installStatus = GetInstallStatus(installDirectory);
         auto store = ReadPasswordStore();
         passwordHint = store.status == StoreStatus::Ready
                            ? L"已保存 " + std::to_wstring(store.passwords.size()) + L" 个不同密码 · 本地读取"
                            : StoreDescription(store.status);
     }
-    statusTitle = installStatus.updateAvailable ? L"插件有可用更新" : installStatus.installed ? (installStatus.supported ? L"已接入 Bandizip" : L"需要重新适配")
-                  : installStatus.supported ? L"准备就绪"
-                                            : L"检查 Bandizip 版本";
-    statusHint = installStatus.updateAvailable ? L"点击“更新接入”，完成后关闭管理器即可照常使用。" : installStatus.installed && installStatus.supported
-                     ? L"照常打开或右键解压。安装后可以关闭此管理器。"
-                 : installStatus.supported ? L"安装一次，以后自动尝试密码管理器中已保存的密码。"
-                                           : L"支持 Bandizip 7.47.0.1 x64，请选择兼容的安装目录。";
+    statusHint = installStatus.detail;
+    if (installStatus.updateAvailable) {
+        statusTitle = L"插件有可用更新";
+    } else if (!installStatus.supported) {
+        statusTitle = L"检查 Bandizip 组件";
+    } else if (installStatus.newerInstalled) {
+        statusTitle = L"已安装较新版本";
+    } else if (installStatus.installed) {
+        statusTitle = L"已接入 Bandizip";
+        statusHint = L"照常打开或右键解压。安装后可以关闭此管理器。";
+    } else {
+        statusTitle = L"准备就绪";
+        if (preview || !installStatus.canUninstall)
+            statusHint = installStatus.backupValid ? installStatus.detail : L"安装后即可使用密码管理器中保存的密码。";
+    }
     SetWindowTextW(directoryText, installDirectory.c_str());
     SendMessageW(enabledCheck, BM_SETCHECK, settings.enabled ? BST_CHECKED : BST_UNCHECKED, 0);
     SendMessageW(notifyCheck, BM_SETCHECK, settings.notify ? BST_CHECKED : BST_UNCHECKED, 0);
@@ -99,8 +107,9 @@ void Refresh() {
     SendMessageW(recycleCheck, BM_SETCHECK, settings.recycle ? BST_CHECKED : BST_UNCHECKED, 0);
     SetWindowTextW(GetDlgItem(mainWindow, InstallButton),
                    installStatus.updateAvailable ? L"更新接入" : installStatus.installed ? L"修复接入" : L"安装接入");
-    EnableWindow(GetDlgItem(mainWindow, InstallButton), installStatus.supported && !elevation);
-    EnableWindow(GetDlgItem(mainWindow, RemoveButton), installStatus.installed && !elevation);
+    EnableWindow(GetDlgItem(mainWindow, InstallButton),
+                 installStatus.supported && !installStatus.newerInstalled && !elevation);
+    EnableWindow(GetDlgItem(mainWindow, RemoveButton), installStatus.canUninstall && !elevation);
     InvalidateRect(mainWindow, nullptr, FALSE);
 }
 void DrawScene(HDC dc) {
@@ -211,10 +220,12 @@ void SaveSettings() {
                       {"RecycleAfterExtract", recycleCheck}})
         data += std::string(item.first) + "=" +
                 (SendMessageW(item.second, BM_GETCHECK, 0, 0) == BST_CHECKED ? "1" : "0") + "\r\n";
-    auto file = Join(DataDirectory(), L"settings.ini");
-    if (!AtomicWrite(file, data)) {
+    auto directory = DataDirectory();
+    auto file = Join(directory, L"settings.ini");
+    if (directory.empty() || !AtomicWrite(file, data)) {
         MessageBoxW(mainWindow, L"设置未能保存，请检查文件夹权限。", L"保存设置", MB_OK | MB_ICONWARNING);
         Refresh();
+        return;
     }
     WritePrivateProfileStringW(nullptr, nullptr, nullptr, file.c_str());
 }
@@ -273,6 +284,11 @@ void ClearRecords() {
     if (MessageBoxW(mainWindow, L"清除本扩展的全部解压记录？", L"清除记录", MB_YESNO | MB_ICONQUESTION) !=
         IDYES)
         return;
+    auto directory = DataDirectory();
+    if (directory.empty()) {
+        MessageBoxW(mainWindow, L"无法访问解压记录目录。", L"清除记录", MB_OK | MB_ICONWARNING);
+        return;
+    }
     HANDLE mutex = CreateMutexW(nullptr, FALSE, L"Local\\BandizipAutoPassword.History.v1");
     auto wait = mutex ? WaitForSingleObject(mutex, 3000) : WAIT_FAILED;
     bool ok = false;
@@ -280,7 +296,7 @@ void ClearRecords() {
         ok = true;
         for (auto name :
              {L"history.jsonl", L"history.jsonl.previous", L"解压记录.txt", L"解压记录.txt.previous"}) {
-            auto file = Join(DataDirectory(), name);
+            auto file = Join(directory, name);
             if (Exists(file) && !DeleteFileW(file.c_str()))
                 ok = false;
         }
@@ -438,6 +454,8 @@ bool RenderPreview(const std::wstring &path) {
     RECT r;
     GetClientRect(mainWindow, &r);
     int width = r.right, height = r.bottom;
+    if (width <= 0 || height <= 0 || width > 4096 || height > 4096)
+        return false;
     auto screen = GetDC(mainWindow), dc = CreateCompatibleDC(screen);
     auto bitmap = CreateCompatibleBitmap(screen, width, height);
     auto old = SelectObject(dc, bitmap);
@@ -461,7 +479,7 @@ bool RenderPreview(const std::wstring &path) {
     info.bmiHeader.biBitCount = 32;
     info.bmiHeader.biCompression = BI_RGB;
     std::string pixels(width * height * 4, '\0');
-    GetDIBits(dc, bitmap, 0, height, pixels.data(), &info, DIB_RGB_COLORS);
+    bool rendered = GetDIBits(dc, bitmap, 0, height, pixels.data(), &info, DIB_RGB_COLORS) == height;
     BITMAPFILEHEADER header = {};
     header.bfType = 0x4d42;
     header.bfOffBits = sizeof(header) + sizeof(info.bmiHeader);
@@ -472,7 +490,7 @@ bool RenderPreview(const std::wstring &path) {
     DeleteObject(bitmap);
     DeleteDC(dc);
     ReleaseDC(mainWindow, screen);
-    return AtomicWrite(path, bytes);
+    return rendered && AtomicWrite(path, bytes);
 }
 } // namespace
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
@@ -492,8 +510,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
         else if (arg == L"--preview-dpi" && i + 1 < argc)
             previewDpi = (UINT)std::clamp(_wtoi(argv[++i]), 96, 288);
         else if (arg == L"--preview-size" && i + 2 < argc) {
-            previewWidth = std::max(320, _wtoi(argv[++i]));
-            previewHeight = std::max(240, _wtoi(argv[++i]));
+            previewWidth = std::clamp(_wtoi(argv[++i]), 320, 4096);
+            previewHeight = std::clamp(_wtoi(argv[++i]), 240, 4096);
         } else if (arg == L"--preview-bottom") previewBottom = true;
         else if (arg == L"--render-preview" && i + 1 < argc) {
             preview = true;
@@ -517,13 +535,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int show) {
     }
     LocalFree(argv);
     if (status) {
-        auto s = GetInstallStatus(installDirectory, packageDirectory);
+        auto s = GetInstallStatus(installDirectory);
         auto text = "{\"supported\":" + std::string(s.supported ? "true" : "false") +
                     ",\"installed\":" + (s.installed ? "true" : "false") +
                     ",\"backup_valid\":" + (s.backupValid ? "true" : "false") +
                     ",\"installed_version\":" + Json(s.installedVersion) +
                     ",\"package_version\":" + Json(ProductVersion) +
                     ",\"update_available\":" + (s.updateAvailable ? "true" : "false") +
+                    ",\"newer_installed\":" + (s.newerInstalled ? "true" : "false") +
+                    ",\"can_uninstall\":" + (s.canUninstall ? "true" : "false") +
                     ",\"version\":" + Json(s.version) + ",\"detail\":" + Json(s.detail) + "}";
         if (!output.empty() && !AtomicWrite(output, text))
             return (int)GetLastError();

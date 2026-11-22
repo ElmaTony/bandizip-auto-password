@@ -112,6 +112,7 @@ int wmain() {
     Check(FileHash(path) == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
           "SHA256 reference");
     Check(!EnsureDirectory(path), "reject file as directory");
+    Check(IsAmd64Image(ModulePath()) && !IsAmd64Image(path), "read AMD64 image headers");
     SourceFile original;
     Check(CaptureSource(path, original), "source identity capture");
     Check(SameSource(original), "unchanged source accepted");
@@ -120,6 +121,8 @@ int wmain() {
     Check(!CaptureSource(Directory(path), original), "directory is not recyclable source");
     Check(!CaptureSource(L"\\\\server\\share\\archive.zip", original), "network source rejected");
     DeleteFileW(path.c_str());
+    std::vector<unsigned char> oldBytes{42};
+    Check(!ReadFileBytes(path, oldBytes) && oldBytes.empty(), "failed read clears previous bytes");
     OutputSnapshot output;
     Check(CaptureOutput(path, output) && !output.existed && SameOutput(output), "removed output can be retried");
     AtomicWrite(path, "new unrelated output");
@@ -139,6 +142,8 @@ int wmain() {
     Check(!LoadSettings().verify, "legacy implicit preflight is not inherited");
     AtomicWrite(settingsFile, "[General]\nFullPreflight=1\nRecycleAfterExtract=1\n");
     Check(LoadSettings().verify && LoadSettings().recycle, "explicit extraction preferences");
+    SetEnvironmentVariableW(L"BZAP_DATA_DIR", settingsFile.c_str());
+    Check(DataDirectory().empty() && !LoadSettings().recycle, "invalid data directory uses safe defaults");
     SetEnvironmentVariableW(L"BZAP_DATA_DIR", oldDataLength && oldDataLength < 32768 ? oldData : nullptr);
     DeleteFileW(settingsFile.c_str());
     RemoveDirectoryW(settingsDirectory.c_str());
@@ -162,6 +167,8 @@ int wmain() {
           "7z next numbered decoy excluded");
     bounded = {volumes[0], volumes[1]};
     Check(!TrimSplitSources(1, volumes[0].path, bounded), "7z incomplete volume set refused");
+    bounded = {volumes[0], volumes[1], volumes[3]};
+    Check(!TrimSplitSources(1, volumes[0].path, bounded), "7z numbering gap keeps all sources");
     AtomicWrite(volumes[0].path, std::string(64, 'x'));
     CaptureSource(volumes[0].path, volumes[0]);
     bounded = volumes;

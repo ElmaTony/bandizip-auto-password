@@ -6,6 +6,12 @@ struct SourceFile {
     std::wstring path;
     BY_HANDLE_FILE_INFORMATION identity{};
 };
+struct SourcePathLess {
+    bool operator()(const std::wstring &left, const std::wstring &right) const {
+        return CompareStringOrdinal(left.c_str(), -1, right.c_str(), -1, TRUE) == CSTR_LESS_THAN;
+    }
+};
+bool SameSourceIdentity(const BY_HANDLE_FILE_INFORMATION &a, const BY_HANDLE_FILE_INFORMATION &b);
 bool CaptureSource(const std::wstring &path, SourceFile &file);
 bool SameSource(const SourceFile &file);
 bool SourcesInUse(const std::vector<SourceFile> &files);

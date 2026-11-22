@@ -19,14 +19,45 @@ inline bool SameOutputPath(const std::wstring &a, const std::wstring &b) {
     auto left = OutputPath(a), right = OutputPath(b);
     return !left.empty() && !right.empty() && _wcsicmp(left.c_str(), right.c_str()) == 0;
 }
+// Only prepare an output inside the directory selected for this extraction.
+// A native rename can supply a different path. Let the host handle that path
+// without creating a placeholder or taking ownership for a retry.
+inline bool WithinOutputRoot(const std::wstring &root, const std::wstring &path) {
+    if (root.empty() || !std::filesystem::path(path).is_absolute())
+        return false;
+    auto full = OutputPath(path);
+    auto prefix = root.back() == L'\\' ? root : root + L'\\';
+    if (full.size() <= prefix.size() || full.compare(0, prefix.size(), prefix) != 0)
+        return false;
+    for (size_t start = prefix.size(); start < full.size();) {
+        auto end = full.find(L'\\', start);
+        auto part = full.substr(start, end - start);
+        if (part.empty() || part.back() == L'.' || part.back() == L' ' ||
+            part.find_first_of(L":/") != std::wstring::npos)
+            return false;
+        if (end == std::wstring::npos)
+            return true;
+        DWORD attributes = GetFileAttributesW(full.substr(0, end).c_str());
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT))
+            return false;
+        start = end + 1;
+    }
+    return false;
+}
 struct OutputSnapshot {
     std::wstring path;
     BY_HANDLE_FILE_INFORMATION identity{};
     bool existed = false;
 };
 inline bool OutputInformation(HANDLE file, BY_HANDLE_FILE_INFORMATION &info) {
-    return GetFileInformationByHandle(file, &info) &&
-           !(info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
+    if (!GetFileInformationByHandle(file, &info))
+        return false;
+    if ((info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) ||
+        !(info.nFileIndexHigh || info.nFileIndexLow)) {
+        SetLastError(ERROR_NOT_SUPPORTED);
+        return false;
+    }
+    return true;
 }
 inline bool CaptureOutput(const std::wstring &path, OutputSnapshot &snapshot) {
     auto full = OutputPath(path);
@@ -69,30 +100,43 @@ struct OutputOwner {
     OutputSnapshot first;
     bool placeholder = false;
 };
-inline bool ReserveOutput(const std::wstring &path, OutputOwner &owner) {
-    auto parent = OutputPath(Directory(path));
-    if (parent.empty()) return false;
-    std::error_code error;
-    std::filesystem::create_directories(parent, error);
-    if (error) return false;
-    OutputSnapshot first;
-    if (!CaptureOutput(path, first)) return false;
-    if (first.existed) {
-        owner = {std::move(first), false};
-        return true;
-    }
+inline bool ReserveNewOutput(const std::wstring &path, OutputOwner &owner) {
     // Reserve identity BEFORE the decoder writes, never adopt an unknown file
     // after failure. The native overwrite callback recognizes this empty file.
-    HANDLE file = CreateFileW(OutputPath(first.path).c_str(), FILE_READ_ATTRIBUTES,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+    HANDLE file = CreateFileW(OutputPath(path).c_str(), FILE_READ_ATTRIBUTES | DELETE,
+                              FILE_SHARE_READ, nullptr,
                               CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
+    OutputSnapshot first{path, {}, true};
     bool valid = OutputInformation(file, first.identity);
+    if (!valid) {
+        FILE_DISPOSITION_INFO remove{TRUE};
+        SetFileInformationByHandle(file, FileDispositionInfo, &remove, sizeof(remove));
+    }
     CloseHandle(file);
     if (!valid) return false;
-    first.existed = true;
     owner = {std::move(first), true};
     return true;
+}
+inline bool ReserveOutput(const std::wstring &path, OutputOwner &owner) {
+    OutputSnapshot first;
+    if (CaptureOutput(path, first)) {
+        if (first.existed) {
+            owner = {std::move(first), false};
+            return true;
+        }
+    } else {
+        if (GetLastError() != ERROR_PATH_NOT_FOUND)
+            return false;
+        auto parent = OutputPath(Directory(path));
+        if (parent.empty())
+            return false;
+        std::error_code error;
+        std::filesystem::create_directories(parent, error);
+        if (error)
+            return false;
+    }
+    return ReserveNewOutput(path, owner);
 }
 inline bool CaptureFailedOutput(const OutputOwner &owner, const std::wstring &path,
                                 OutputSnapshot &snapshot) {

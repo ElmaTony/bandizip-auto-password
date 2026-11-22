@@ -9,7 +9,9 @@
 #include <atomic>
 #include <functional>
 #include <memory>
+#include <map>
 #include <mutex>
+#include <set>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -97,6 +99,7 @@ BOOL CALLBACK EnableBuild(PINIT_ONCE, void *, void **) {
 }
 struct Plan {
     size_t next = 0;
+    size_t lastVerificationRetry = SIZE_MAX, lastDiskRetry = SIZE_MAX;
     int last = -1, confirmed = -1;
     bool confirmedOffered = false;
 };
@@ -111,18 +114,23 @@ struct Context {
     Settings settings;
     std::unordered_map<const ark::FileItem *, Plan> plans;
     std::wstring path;
-    std::vector<SourceFile> observedSources, pendingSources;
-    std::vector<std::wstring> usedSources;
+    std::map<std::wstring, SourceFile, SourcePathLess> observedSources;
+    std::set<std::wstring, SourcePathLess> usedSources;
+    std::vector<SourceFile> pendingSources;
+    bool rootObservedAtOpen = false;
     std::unordered_set<const ark::FileItem *> requiredItems, writtenItems;
     std::unordered_set<const ark::FileItem *> successfulItems, skippedItems, retryItems;
     std::unordered_map<const ark::FileItem *, std::wstring> outputPaths;
     std::unordered_map<const ark::FileItem *, OutputOwner> outputOwners;
     std::unordered_map<const ark::FileItem *, OutputSnapshot> retryOutputs;
+    std::wstring outputRoot;
     bool canResume = false;
     std::vector<int> selection;
     std::atomic<bool> recycleBlocked{false};
     std::atomic<bool> preflight{false}, exhausted{false}, canceled{false}, ambiguous{false};
     std::atomic<bool> hadDataError{false};
+    std::atomic<bool> outputChanged{false};
+    std::atomic<ark::Error> verificationError{0}, terminalError{0};
     std::atomic<unsigned> attempts{0}, completed{0};
     std::atomic<unsigned> extractionDepth{0};
     bool openingRejected = false;
@@ -130,25 +138,17 @@ struct Context {
     std::atomic<unsigned> openingAttempts{0};
     std::atomic<ark::Error> lastError{0}, overrideError{0};
     bool reported = false;
-    void ObserveSource(const wchar_t *name, bool used = false) {
+    bool ObserveSource(const wchar_t *name, bool used = false) {
         if (!name || !*name)
-            return;
+            return false;
         SourceFile file;
         if (!CaptureSource(name, file))
-            return;
+            return false;
         std::lock_guard<std::mutex> guard(mutex);
-        if (used) {
-            bool known = false;
-            for (const auto &old : usedSources)
-                if (_wcsicmp(old.c_str(), file.path.c_str()) == 0)
-                    known = true;
-            if (!known)
-                usedSources.push_back(file.path);
-        }
-        for (const auto &old : observedSources)
-            if (_wcsicmp(old.path.c_str(), file.path.c_str()) == 0)
-                return;
-        observedSources.push_back(std::move(file));
+        if (used)
+            usedSources.insert(file.path);
+        observedSources.try_emplace(file.path, file);
+        return true;
     }
     std::vector<std::wstring> EngineSources() {
         auto count = ark::Method<size_t(WINAPI *)(void *)>(original, 49)(object);
@@ -201,23 +201,28 @@ struct Context {
         ark::Method<void(WINAPI *)(void *)>(original, 6)(object);
         FinishRecycle(true);
     }
-    void PrepareRecycle() {
+    void PrepareRecycle(bool diskExtraction, int selectedCount, const std::unordered_set<int> &selected) {
         requiredItems.clear();
         writtenItems.clear();
         recycleBlocked = false;
-        if (!settings.recycle)
+        if (!settings.recycle || !diskExtraction)
             return;
-        ObserveEngineSources();
         if (ark::Method<int(WINAPI *)(void *)>(original, 16)(object)) {
             recycleBlocked = true;
             return;
         }
         int count = ark::Method<int(WINAPI *)(void *)>(original, 13)(object);
-        if (count <= 0 || count > 10000000) {
+        if (count <= 0 || count > 10000000 ||
+            (selectedCount != 0 && (selectedCount != count || selected.size() != (size_t)count))) {
             recycleBlocked = true;
             return;
         }
+        ObserveEngineSources();
         for (int i = 0; i < count; ++i) {
+            if (selectedCount && !selected.count(i)) {
+                recycleBlocked = true;
+                return;
+            }
             auto item = ark::Method<const ark::FileItem *(WINAPI *)(void *, int)>(original, 14)(object, i);
             if (!item) {
                 recycleBlocked = true;
@@ -242,7 +247,8 @@ struct Context {
         std::vector<SourceFile> files;
         bool rootIncluded = false;
         SourceFile root;
-        bool confirmed = CaptureSource(path, root) && !names.empty();
+        bool confirmed = rootObservedAtOpen && CaptureSource(path, root) && !names.empty();
+        std::set<std::wstring, SourcePathLess> included;
         auto style = ark::Method<int(WINAPI *)(void *)>(original, 48)(object);
         for (const auto &name : names) {
             SourceFile current;
@@ -250,32 +256,19 @@ struct Context {
                 confirmed = false;
                 break;
             }
-            bool used = false;
-            for (const auto &source : usedSources)
-                if (_wcsicmp(source.c_str(), current.path.c_str()) == 0)
-                    used = true;
             // Some engine versions enumerate similarly named RAR files even
             // after the actual last volume. Only recycle volumes it consumed.
-            if ((style == 6 || style == 7 || style == 8) && !used)
+            if ((style == 6 || style == 7 || style == 8) && !usedSources.count(current.path))
                 continue;
-            bool observed = false, duplicate = false;
-            for (const auto &old : observedSources) {
-                if (_wcsicmp(old.path.c_str(), current.path.c_str()) != 0)
-                    continue;
-                observed = SameSource(old);
-                if (_wcsicmp(root.path.c_str(), old.path.c_str()) == 0)
-                    rootIncluded = true;
-                for (const auto &f : files)
-                    if (_wcsicmp(f.path.c_str(), old.path.c_str()) == 0)
-                        duplicate = true;
-                if (!duplicate)
-                    files.push_back(old);
-                break;
-            }
-            if (!observed) {
+            auto observed = observedSources.find(current.path);
+            if (observed == observedSources.end() || !SameSourceIdentity(observed->second.identity, current.identity)) {
                 confirmed = false;
                 break;
             }
+            if (_wcsicmp(root.path.c_str(), current.path.c_str()) == 0)
+                rootIncluded = true;
+            if (included.insert(current.path).second)
+                files.push_back(observed->second);
         }
         if (!confirmed || !rootIncluded || !TrimSplitSources(style, root.path, files) ||
             (names.size() > 1 && files.size() < 2)) {
@@ -292,7 +285,7 @@ struct Context {
     void Refresh() {
         settings = LoadSettings();
         store = PasswordStore();
-        if (settings.enabled)
+        if (settings.enabled && !passThrough)
             store = ReadPasswordStore();
     }
     bool CanMatch() const {
@@ -300,7 +293,7 @@ struct Context {
                !store.passwords.empty();
     }
     bool CanRetry(ark::Error error, const ark::FileItem *item) {
-        if (!canResume || preflight || !CanMatch() ||
+        if (!canResume || preflight || exhausted || canceled || !CanMatch() ||
             (error != ark::CrcError && error != ark::PasswordOrData))
             return false;
         std::lock_guard<std::mutex> guard(mutex);
@@ -310,6 +303,42 @@ struct Context {
     ark::Error RawError() {
         return ark::Method<ark::Error(WINAPI *)(void *)>(original, 36)(object);
     }
+    void VerificationFailed(ark::Error error, const ark::FileItem *item) {
+        verificationError = error;
+        if (error != ark::CrcError && error != ark::PasswordOrData)
+            return;
+        hadDataError = true;
+        std::lock_guard<std::mutex> guard(mutex);
+        auto found = plans.find(item);
+        if (found == plans.end() || found->second.last < 0)
+            return;
+        auto &plan = found->second;
+        plan.confirmed = -1;
+        if (plan.next >= store.passwords.size()) {
+            exhausted = true;
+        } else if (plan.lastVerificationRetry != plan.next) {
+            plan.lastVerificationRetry = plan.next;
+            ambiguous = true;
+        }
+    }
+    void RejectChangedOutput() {
+        outputChanged = true;
+        canceled = true;
+        recycleBlocked = true;
+    }
+    ark::Error FailureCode() {
+        if (canceled)
+            return ark::Canceled;
+        if (exhausted)
+            return hadDataError ? ark::PasswordOrData : ark::PasswordWrong;
+        if (auto code = terminalError.load())
+            return code;
+        if (auto code = verificationError.load())
+            return code;
+        if (auto code = RawError())
+            return code;
+        return lastError ? lastError.load() : ark::CannotOpen;
+    }
     void ClearEnginePassword() {
         ark::Method<void(WINAPI *)(void *, const wchar_t *)>(original, 11)(object, nullptr);
     }
@@ -318,7 +347,7 @@ struct Context {
         for (auto &p : plans)
             p.second.confirmedOffered = false;
     }
-    void Reset(const wchar_t *file) {
+    void Reset(const wchar_t *file, bool nativeOnly = false) {
         FinishBeforeOpen();
         path = file ? file : L"（内存中的压缩包）";
         observedSources.clear();
@@ -334,17 +363,18 @@ struct Context {
         outputOwners.clear();
         retryOutputs.clear();
         canResume = false;
-        if (file)
-            ObserveSource(file, true);
+        rootObservedAtOpen = file && ObserveSource(file, true);
         plans.clear();
         attempts = 0;
         completed = 0;
         openingAttempts = 0;
-        passThrough = false;
+        passThrough = nativeOnly;
         exhausted = false;
         canceled = false;
         ambiguous = false;
         hadDataError = false;
+        outputChanged = false;
+        terminalError = verificationError = 0;
         lastError = 0;
         overrideError = 0;
         reported = false;
@@ -358,23 +388,26 @@ struct Context {
             return;
         Result result;
         result.archive = path.empty() ? L"（未能识别名称的压缩包）" : path;
-        result.error = success ? 0 : canceled ? ark::Canceled : RawError();
+        result.error = success ? 0 : FailureCode();
         result.attempts = attempts;
         result.savedCount = store.passwords.size();
         result.completedFiles = completed;
         result.opening = opening;
         if (success)
-            result.outcome = L"success";
+            result.outcome = !opening && !skippedItems.empty() ? L"skipped_items" : L"success";
+        else if (outputChanged) {
+            result.outcome = L"output_changed";
+            result.error = HRESULT_FROM_WIN32(ERROR_FILE_INVALID);
+        } else if (exhausted)
+            result.outcome = hadDataError ? L"password_or_data_error" : L"passwords_exhausted";
         else if (canceled)
             result.outcome = L"canceled";
-        else if (exhausted || hadDataError)
-            result.outcome = (hadDataError || lastError == ark::CrcError || lastError == ark::PasswordOrData)
-                                 ? L"password_or_data_error"
-                                 : L"passwords_exhausted";
+        else if (result.error == ark::CrcError || result.error == ark::PasswordOrData)
+            result.outcome = attempts ? L"password_or_data_error" : L"data_error";
         else
             result.outcome = L"error";
         reported = true;
-        RecordResult(result, settings.notify && (exhausted.load() || hadDataError.load()));
+        RecordResult(result, settings.notify && !success && (outputChanged || exhausted || hadDataError));
     }
 };
 std::shared_ptr<Context> Find(void *object) {
@@ -497,18 +530,27 @@ struct EventProxy : ark::Events {
                 target->StartFile(item, stop, all, index, path, changed ? &output : nullptr);
             std::lock_guard<std::mutex> guard(context->mutex);
             auto retry = context->retryOutputs.find(item);
-            if (retry != context->retryOutputs.end()) {
-                if (!SameOutput(retry->second)) {
+            if (retry != context->retryOutputs.end() && !stop && !all) {
+                const auto &snapshot = retry->second;
+                bool redirect = !SameOutputPath(output.name, snapshot.path);
+                // For a missing retry destination, CREATE_NEW both checks the
+                // expected absence and takes ownership. Never adopt a new arrival.
+                bool owned = WithinOutputRoot(context->outputRoot, snapshot.path) && (!redirect || changed) &&
+                             (snapshot.existed ? SameOutput(snapshot)
+                                               : ReserveNewOutput(snapshot.path, context->outputOwners[item]));
+                if (!owned) {
+                    context->RejectChangedOutput();
                     all = TRUE;
-                } else
-                    output.Set(retry->second.path.c_str());
+                } else if (redirect)
+                    output.Set(snapshot.path.c_str());
             }
             context->outputPaths[item] = output.name;
             if (stop) context->skippedItems.insert(item);
             DWORD attributes = 0;
             if (item) memcpy(&attributes, (const BYTE *)item + 44, sizeof(attributes));
             if (!stop && !all && item && !(attributes & FILE_ATTRIBUTE_DIRECTORY) &&
-                context->canResume && context->CanMatch()) {
+                context->canResume && retry == context->retryOutputs.end() &&
+                WithinOutputRoot(context->outputRoot, output.name)) {
                 OutputOwner owner;
                 if (ReserveOutput(output.name, owner)) context->outputOwners[item] = std::move(owner);
             }
@@ -522,8 +564,16 @@ struct EventProxy : ark::Events {
         // Native progress also carries the existing Cancel button's state.
         if (target)
             target->ProgressFile(info, stop, all);
-        if (stop || all)
+        if (all || (stop && context->preflight))
             context->canceled = true;
+        if (stop && !context->preflight) {
+            context->recycleBlocked = true;
+            auto file = currentItems.find(context);
+            if (file != currentItems.end()) {
+                std::lock_guard<std::mutex> guard(context->mutex);
+                context->skippedItems.insert(file->second);
+            }
+        }
     }
     void WINAPI CompleteFile(const ark::Progress *info, ark::Error error) override {
         auto item = currentItems.find(context);
@@ -539,11 +589,15 @@ struct EventProxy : ark::Events {
                 p->second.confirmed = p->second.last;
         }
         bool retry = context->CanRetry(error, key);
+        if (error && context->preflight)
+            context->VerificationFailed(error, key);
         if (retry) {
             std::lock_guard<std::mutex> guard(context->mutex);
             context->retryItems.insert(key);
         }
         if (!context->preflight && !retry) {
+            if (error && error != ark::UserSkip)
+                context->terminalError = error;
             if (error == ark::UserSkip && key) {
                 std::lock_guard<std::mutex> guard(context->mutex);
                 context->skippedItems.insert(key);
@@ -577,30 +631,18 @@ struct EventProxy : ark::Events {
             stop = TRUE;
             return;
         }
+        if (!context->preflight && error && !warning && error != ark::UserSkip)
+            context->terminalError = error;
         if (!context->preflight && error)
             context->recycleBlocked = true;
         context->lastError = error;
         if (error == ark::CrcError || error == ark::PasswordOrData)
             context->hadDataError = true;
-        if (error == ark::Canceled)
+        if (error == ark::Canceled && !context->exhausted)
             context->canceled = true;
         if (context->preflight) {
-            if (!context->exhausted && (error == ark::CrcError || error == ark::PasswordOrData)) {
-                std::lock_guard<std::mutex> guard(context->mutex);
-                if (!item) {
-                    auto current = currentItems.find(context);
-                    if (current != currentItems.end())
-                        item = current->second;
-                }
-                auto found = context->plans.find(item);
-                if (found != context->plans.end() && found->second.last >= 0) {
-                    found->second.confirmed = -1;
-                    if (found->second.next < context->store.passwords.size())
-                        context->ambiguous = true;
-                    else
-                        context->exhausted = true;
-                }
-            }
+            if (error)
+                context->VerificationFailed(error, item);
             stop = TRUE;
             return;
         }
@@ -629,19 +671,23 @@ struct EventProxy : ark::Events {
             auto owner = context->outputOwners.find(item);
             if (owner != context->outputOwners.end() && owner->second.placeholder && path &&
                 SameOutputPath(path, owner->second.first.path) && SameOutput(owner->second.first)) {
+                if (!WithinOutputRoot(context->outputRoot, path)) {
+                    context->RejectChangedOutput();
+                    mode = 3;
+                    return;
+                }
                 mode = 0;
                 return;
             }
             auto retry = context->retryOutputs.find(item);
             if (retry != context->retryOutputs.end()) {
                 mode = retry->second.existed && path &&
+                               WithinOutputRoot(context->outputRoot, path) &&
                                SameOutputPath(path, retry->second.path) && SameOutput(retry->second)
                            ? 0
                            : 3;
-                if (mode == 3) {
-                    context->canceled = true;
-                    context->recycleBlocked = true;
-                }
+                if (mode == 3)
+                    context->RejectChangedOutput();
                 return;
             }
         }
@@ -652,7 +698,7 @@ struct EventProxy : ark::Events {
             std::lock_guard<std::mutex> guard(context->mutex);
             context->outputPaths[item] = output.name;
             if (mode == 1 || mode == 3) context->skippedItems.insert(item);
-            else if (context->canResume && context->CanMatch() &&
+            else if (context->canResume && WithinOutputRoot(context->outputRoot, output.name) &&
                      (context->outputOwners.find(item) == context->outputOwners.end() ||
                       !SameOutputPath(context->outputOwners[item].first.path, output.name))) {
                 OutputOwner owner;
@@ -661,6 +707,8 @@ struct EventProxy : ark::Events {
         }
         if (mode == 1 || mode == 3)
             context->recycleBlocked = true;
+        if (mode == 3)
+            context->canceled = true;
     }
     void WINAPI AskPassword(const ark::FileItem *item, int why, int &answer,
                             ark::SetString *destination) override {
@@ -842,35 +890,32 @@ bool Verify(const std::shared_ptr<Context> &c, const std::function<int(ark::Outp
             c.preflight = false;
         }
     } phase(*c);
-    bool success = false;
     for (;;) {
         c->ambiguous = false;
+        c->verificationError = 0;
         c->ResetOffers();
         DiscardOutput discard;
-        success = verify(&discard) != 0;
-        if (success || c->canceled || c->exhausted || !c->ambiguous)
-            break;
+        bool success = verify(&discard) != 0;
+        if (c->canceled || c->exhausted)
+            return false;
+        if (!c->ambiguous)
+            return success && !c->verificationError;
         Trace(L"RETRY_AFTER_PASSWORD_OR_CRC_ERROR");
         c->ClearEnginePassword();
     }
-    return success && !c->canceled && !c->exhausted;
 }
 int WINAPI OpenStreamHook(void *o, void *stream, const wchar_t *password) {
     auto c = Find(o);
     if (!c)
         return FALSE;
-    c->Reset(nullptr);
-    c->passThrough = true;
-    c->store.Clear();
+    c->Reset(nullptr, true);
     return ark::Method<int(WINAPI *)(void *, void *, const wchar_t *)>(c->original, 2)(o, stream, password);
 }
 int WINAPI OpenBytesHook(void *o, unsigned char *bytes, int length, const wchar_t *password) {
     auto c = Find(o);
     if (!c)
         return FALSE;
-    c->Reset(nullptr);
-    c->passThrough = true;
-    c->store.Clear();
+    c->Reset(nullptr, true);
     return ark::Method<int(WINAPI *)(void *, unsigned char *, int, const wchar_t *)>(c->original, 3)(
         o, bytes, length, password);
 }
@@ -919,7 +964,8 @@ void WINAPI ClearSelectionHook(void *object) {
 int Execute(void *object, const std::function<int()> &extract,
             const std::function<int(ark::Output *)> &verify, bool diskExtraction = false,
             bool selectedExtraction = false,
-            const std::function<int(const std::vector<int> &)> &resume = {}) {
+            const std::function<int(const std::vector<int> &)> &resume = {},
+            const wchar_t *destination = nullptr) {
     auto c = Find(object);
     if (!c)
         return FALSE;
@@ -946,12 +992,13 @@ int Execute(void *object, const std::function<int()> &extract,
     c->attempts = c->openingAttempts.exchange(0);
     c->lastError = 0;
     c->hadDataError = false;
+    c->outputChanged = false;
+    c->terminalError = c->verificationError = 0;
+    c->store = c->settings.enabled ? ReadPasswordStore() : PasswordStore();
     if (!c->settings.enabled && !c->settings.recycle)
         return extract();
-    c->store = c->settings.enabled ? ReadPasswordStore() : PasswordStore();
     c->plans.clear();
     c->exhausted = false;
-    c->PrepareRecycle();
     c->successfulItems.clear();
     c->skippedItems.clear();
     c->retryItems.clear();
@@ -963,17 +1010,21 @@ int Execute(void *object, const std::function<int()> &extract,
     if (!selectedCount)
         selected.clear();
     const std::unordered_set<int> selectedIndices(selected.begin(), selected.end());
+    c->PrepareRecycle(diskExtraction, selectedCount, selectedIndices);
     bool selectionKnown = !selectedExtraction || selectedCount == (int)selected.size();
     auto isEncrypted = ark::Method<int(WINAPI *)(void *)>(c->original, 17);
-    c->canResume = bool(resume) && selectionKnown && c->CanMatch() && isEncrypted(object);
+    c->outputRoot = destination && *destination ? OutputPath(destination) : std::wstring{};
+    c->canResume = bool(resume) && !c->outputRoot.empty() && selectionKnown && c->CanMatch() && isEncrypted(object);
     struct ResumeState {
         Context &c;
         ~ResumeState() {
             c.canResume = false;
             c.retryOutputs.clear();
             for (const auto &entry : c.outputOwners)
-                if (!c.successfulItems.count(entry.first)) RemoveEmptyReservation(entry.second);
+                if (!c.successfulItems.count(entry.first) && WithinOutputRoot(c.outputRoot, entry.second.first.path))
+                    RemoveEmptyReservation(entry.second);
             c.outputOwners.clear();
+            c.outputRoot.clear();
         }
     } resumeState{*c};
     auto restoreSelection = [&] {
@@ -997,14 +1048,14 @@ int Execute(void *object, const std::function<int()> &extract,
         }
         if (!verified || c->canceled) {
             c->canResume = false;
-            if (c->canceled) c->overrideError = ark::Canceled;
+            c->overrideError = c->FailureCode();
             c->Record(false, false);
             return FALSE;
         }
     }
     c->ResetOffers();
     int result = extract();
-    while (!c->retryItems.empty() && c->canResume && !c->canceled) {
+    while (!c->retryItems.empty() && c->canResume && !c->canceled && !c->exhausted && !c->terminalError) {
         auto failed = std::move(c->retryItems);
         c->retryItems.clear();
         std::vector<int> remaining;
@@ -1028,12 +1079,18 @@ int Execute(void *object, const std::function<int()> &extract,
             if (name == c->outputPaths.end() || owner == c->outputOwners.end() ||
                 !CaptureFailedOutput(owner->second, name->second, output)) {
                 Trace(L"RETRY_OUTPUT_UNCONFIRMED");
-                c->canceled = true;
-                c->recycleBlocked = true;
+                c->RejectChangedOutput();
                 verified = false;
                 break;
             }
-            c->plans[item].confirmed = -1;
+            auto &plan = c->plans[item];
+            if (plan.lastDiskRetry == plan.next) {
+                c->terminalError = ark::PasswordOrData;
+                verified = false;
+                break;
+            }
+            plan.lastDiskRetry = plan.next;
+            plan.confirmed = -1;
             c->ClearEnginePassword();
             Trace(L"VERIFY_FAILED_ITEM_ONLY index=" + std::to_wstring(index));
             if (!output.existed)
@@ -1059,11 +1116,9 @@ int Execute(void *object, const std::function<int()> &extract,
     if (selectedExtraction && !ark::Method<int(WINAPI *)(void *)>(c->original, 31)(object))
         c->selection.clear();
     Trace(L"EXTRACT_RETURN " + std::to_wstring(result));
-    if (!result)
-        c->lastError = c->RawError();
-    if (c->canceled) {
+    if (!result || c->canceled || c->exhausted || c->terminalError) {
         result = FALSE;
-        c->overrideError = ark::Canceled;
+        c->overrideError = c->FailureCode();
     }
     c->Record(result != 0, false);
     if (diskExtraction)
@@ -1073,14 +1128,36 @@ int Execute(void *object, const std::function<int()> &extract,
 // Slots inside overloaded groups are in MSVC order, deliberately independent
 // of the C++ compiler used to build this proxy (including Zig/Clang).
 int ResumeTo(const std::shared_ptr<Context> &c, const wchar_t *path, const wchar_t *remove,
-             const std::vector<int> &indices) {
-    ark::Method<void(WINAPI *)(void *)>(c->original, 30)(c->object);
-    c->selection = indices;
-    for (int index : indices)
-        if (!ark::Method<int(WINAPI *)(void *, int)>(c->original, 29)(c->object, index))
+             const std::vector<int> &indices, bool preservePending) {
+    auto clear = ark::Method<void(WINAPI *)(void *)>(c->original, 30);
+    auto add = ark::Method<int(WINAPI *)(void *, int)>(c->original, 29);
+    std::vector<int> saved;
+    if (preservePending) {
+        int count = ark::Method<int(WINAPI *)(void *)>(c->original, 31)(c->object);
+        if (count && count != (int)c->selection.size())
             return FALSE;
-    return ark::Method<int(WINAPI *)(void *, const wchar_t *, const wchar_t *)>(c->original,
-                                                                                33)(c->object, path, remove);
+        if (count)
+            saved = c->selection;
+    }
+    auto select = [&](const std::vector<int> &items) {
+        clear(c->object);
+        c->selection.clear();
+        for (int index : items) {
+            if (!add(c->object, index)) {
+                clear(c->object);
+                return false;
+            }
+        }
+        c->selection = items;
+        return true;
+    };
+    int result = FALSE;
+    if (select(indices))
+        result = ark::Method<int(WINAPI *)(void *, const wchar_t *, const wchar_t *)>(c->original, 33)(
+            c->object, path, remove);
+    // An all-files operation borrows the native selection. A selected-files
+    // operation consumes it. Never expose a half-built internal retry list.
+    return select(saved) ? result : FALSE;
 }
 int WINAPI AllWHook(void *o, const wchar_t *path, const wchar_t *remove) {
     auto c = Find(o);
@@ -1094,7 +1171,7 @@ int WINAPI AllWHook(void *o, const wchar_t *path, const wchar_t *remove) {
             return ark::Method<int(WINAPI *)(void *, ark::Output *, const wchar_t *)>(c->original,
                                                                                       21)(o, sink, remove);
         },
-        true, false, [=](const std::vector<int> &indices) { return ResumeTo(c, path, remove, indices); });
+        true, false, [=](const std::vector<int> &indices) { return ResumeTo(c, path, remove, indices, true); }, path);
 }
 int WINAPI AllAHook(void *o, const char *path, const wchar_t *remove) {
     auto c = Find(o);
@@ -1134,7 +1211,7 @@ int WINAPI MultiWHook(void *o, const wchar_t *path, const wchar_t *remove) {
         [=](ark::Output *sink) {
             return ark::Method<int(WINAPI *)(void *, ark::Output *)>(c->original, 32)(o, sink);
         },
-        true, true, [=](const std::vector<int> &indices) { return ResumeTo(c, path, remove, indices); });
+        true, true, [=](const std::vector<int> &indices) { return ResumeTo(c, path, remove, indices, false); }, path);
 }
 int WINAPI MultiAHook(void *o, const char *path) {
     auto c = Find(o);

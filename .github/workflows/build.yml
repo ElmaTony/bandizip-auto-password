@@ -17,3 +17,6 @@ jobs:
         run: python tools/privacy_check.py
       - name: Release validation regressions
         run: python -m unittest discover -s tests -p "test_*.py"
+      - name: Verify distribution archives
+        shell: pwsh
+        run: python tools/package.py --output (Join-Path $env:RUNNER_TEMP 'bzap-distribution')
