@@ -3,8 +3,9 @@ from pathlib import Path
 import argparse
 import hashlib
 import re
+import shutil
 import subprocess
-import tempfile
+import uuid
 import zipfile
 
 from privacy_check import RUNTIME, RUNTIME_DOCS, check_artifacts, check_bytes, forbidden
@@ -51,6 +52,26 @@ def write_archives(output, commit):
     return checksums
 
 
+def publish_archives(output, commit):
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # The published directory must inherit access from the chosen destination.
+    # A child of mkdtemp() keeps its owner-only Windows ACL after a rename.
+    staging = output.parent / ('.bzap-package-' + uuid.uuid4().hex)
+    staging.mkdir()
+    try:
+        checksums = write_archives(staging, commit)
+        errors, _ = check_artifacts(staging)
+        if errors:
+            raise ValueError('Release validation failed: ' + ', '.join(errors))
+        if output.exists():
+            output.rmdir()  # Accept only an empty destination, including at commit time.
+        staging.rename(output)
+    except BaseException:
+        shutil.rmtree(staging)
+        raise
+    return checksums
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', type=Path, required=True)
@@ -62,18 +83,7 @@ def main():
     if subprocess.check_output(['git', 'status', '--porcelain'], cwd=ROOT):
         raise ValueError('Commit the intended source before packaging.')
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=output.parent, prefix='.bzap-package-') as temporary:
-        staging = Path(temporary) / 'release'
-        staging.mkdir()
-        checksums = write_archives(staging, commit)
-        errors, _ = check_artifacts(staging)
-        if errors:
-            raise ValueError('Release validation failed: ' + ', '.join(errors))
-        if output.exists():
-            output.rmdir()  # Accept only an empty destination, including at commit time.
-        staging.rename(output)
-    print(checksums, end='')
+    print(publish_archives(output, commit), end='')
 
 
 if __name__ == '__main__':

@@ -4,6 +4,7 @@ import os
 import sys,tempfile,unittest,warnings,zipfile
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'tools'))
+import package as packager
 from privacy_check import check_artifacts, RUNTIME, RUNTIME_DOCS, SOURCE_BUILD
 
 class ArtifactChecks(unittest.TestCase):
@@ -84,5 +85,29 @@ class ArtifactChecks(unittest.TestCase):
             package.comment = b'synthetic-test-marker'
         with patch.dict(os.environ, BZAP_PRIVATE_TERMS='synthetic-test-marker'):
             self.assertTrue(check_artifacts(path)[0])
+
+    def test_release_staging_inherits_from_destination_parent(self):
+        output = self.root / 'published'
+
+        def write(staging, commit):
+            self.assertEqual(staging.parent, output.parent)
+            self.assertFalse(output.exists())
+            for name in RUNTIME:
+                (staging / name).write_bytes(b'fixture')
+            return 'done'
+
+        with patch.object(packager, 'write_archives', side_effect=write):
+            self.assertEqual(packager.publish_archives(output, 'fixture'), 'done')
+        self.assertEqual(list(self.root.iterdir()), [output])
+        self.assertEqual({p.name for p in output.iterdir()}, RUNTIME)
+
+    def test_failed_release_cleans_staging_and_keeps_destination(self):
+        output = self.root / 'published'
+        output.mkdir()
+        with patch.object(packager, 'write_archives', return_value=''):
+            with self.assertRaisesRegex(ValueError, 'Release validation failed'):
+                packager.publish_archives(output, 'fixture')
+        self.assertEqual(list(self.root.iterdir()), [output])
+        self.assertEqual(list(output.iterdir()), [])
 
 if __name__=='__main__':unittest.main()
